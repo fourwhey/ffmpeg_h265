@@ -539,6 +539,7 @@ function ParseStreamInfo
                         DispositionStillImage      = $stream["disposition_still_image"]
                         DispositionMultilayer      = $stream["disposition_multilayer"]
                     };
+                    continue;
                 }                
                 "video"
                 {
