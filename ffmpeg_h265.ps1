@@ -91,8 +91,10 @@ Write-Host "Script Root: '$($script:ScriptRoot)'"
 
 # Path to ffmpeg binary (customize as needed)
 $script:ffmpeg_path = "C:\ffmpeg"
+$script:ffmpeg_exec = Join-Path $script:ffmpeg_path "ffmpeg.exe"
+$script:ffprobe_exec = Join-Path $script:ffmpeg_path "ffprobe.exe"
 # Log file name and path
-$script:logFileName = "ffmpeg_convert_$(Get-Date -Format "yyyyMMddHHmmssffff").log";
+$script:logFileName = "ffmpeg_h265_$(Get-Date -Format "yyyyMMddHHmmssffff").log";
 $script:logFilePath = Join-Path $script:ScriptRoot $script:logFileName;
 
 # LogLevel enum for structured logging
@@ -731,7 +733,7 @@ enum ArrType
 }
 
 # Try and clean up old log files.
-$logFilter = "$($script:ScriptRoot)\ffmpeg_convert*.log";
+$logFilter = "$($script:ScriptRoot)\ffmpeg_h265_*.log";
 
 # Get logs that are at least 1 hour old.
 $logs = Get-Item -Path $logFilter -Exclude $script:logFileName | Where-Object { $_.CreationTime -lt (Get-Date).AddMinutes(-60) };
@@ -942,45 +944,11 @@ function GetArrTitleIds()
     }
 }
 
-# function GetCQPRateControl
-# {
-#   $RateCtrl = $CQPRateControl;
-  
-#   if ( $CQPRateCtrl -eq 0 )
-#   {
-#     if ( (($impm - $tmpm) / 4) -ge 1 )
-#     {
-#       $RateCtrl = 28 + [int](($impm - $tmpm) / 10);
-#     }
-#     $RateCtrl = (( $RateCtrl -gt 29 ) ? (( $ismb -ge 1000 ) ? 29 : 28 ) : $RateCtrl);
-#   }
-#   Write-Host "`r`nRc: $($RateCtrl), Src: $($SrcResType), Res: $($SrcResW):$($SrcResH), iMB: $($ismb), iMB/min: $($impm), tMB/min: $($tmpm)" -NoNewline;
-
-#   return "-qp:v $($RateCtrl)";
-# }
-
-# function GetBitrateControl
-# {
-#   $RateCtrl = $BitrateControl;
-  
-#   if ( $RateCtrl -ne "" )
-#   {
-#     $RateCtrl = "-b:v $($RateCtrl)";
-#     Write-Host ", Bitrate: $($BitrateControl)";
-#   }
-#   else 
-#   {
-#     Write-Host
-#   }
-  
-#   return $RateCtrl;
-# }
-
 # Function to get video duration using ffprobe
 function Get-VideoDuration 
 {
     param ($filePath)
-    $duration = & "$($script:ffmpeg_path)\ffprobe.exe" -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$filePath"
+    $duration = & "$($script:ffprobe_exec)" -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$filePath"
     return [TimeSpan]::FromSeconds([double]$duration)
 }
 
@@ -1207,11 +1175,11 @@ try
             Write-Log -Message "$($_)`r`nStackTrace: $($Error[0].Exception.StackTrace)" -Level Error;
         }
     
-        $metadata = ((&"$($script:ffmpeg_path)\ffprobe.exe" $_.FullName -hide_banner -analyzeduration 4GB -probesize 4GB 2>&1 | Out-String ).Trim());
-        $vid_stream_info = ((&"$($script:ffmpeg_path)\ffprobe.exe" $_.FullName -hide_banner -analyzeduration 4GB -probesize 4GB -v quiet -select_streams v:0 -show_streams | Out-String ).Trim());
-        $aud_stream_info = ((&"$($script:ffmpeg_path)\ffprobe.exe" $_.FullName -hide_banner -analyzeduration 4GB -probesize 4GB -v quiet -select_streams a -show_streams | Out-String ).Trim());
-        $sub_stream_info = ((&"$($script:ffmpeg_path)\ffprobe.exe" $_.FullName -hide_banner -analyzeduration 4GB -probesize 4GB -v quiet -select_streams s -show_streams | Out-String ).Trim());
-        $vid_stream_format = ((&"$($script:ffmpeg_path)\ffprobe.exe" $_.FullName -hide_banner -analyzeduration 4GB -probesize 4GB -v quiet -select_streams v:0 -show_format -sexagesimal | Out-String ).Trim());
+        $metadata = ((&"$($script:ffprobe_exec)" $_.FullName -hide_banner -analyzeduration 4GB -probesize 4GB 2>&1 | Out-String ).Trim());
+        $vid_stream_info = ((&"$($script:ffprobe_exec)" $_.FullName -hide_banner -analyzeduration 4GB -probesize 4GB -v quiet -select_streams v:0 -show_streams | Out-String ).Trim());
+        $aud_stream_info = ((&"$($script:ffprobe_exec)" $_.FullName -hide_banner -analyzeduration 4GB -probesize 4GB -v quiet -select_streams a -show_streams | Out-String ).Trim());
+        $sub_stream_info = ((&"$($script:ffprobe_exec)" $_.FullName -hide_banner -analyzeduration 4GB -probesize 4GB -v quiet -select_streams s -show_streams | Out-String ).Trim());
+        $vid_stream_format = ((&"$($script:ffprobe_exec)" $_.FullName -hide_banner -analyzeduration 4GB -probesize 4GB -v quiet -select_streams v:0 -show_format -sexagesimal | Out-String ).Trim());
 
         $defaultAudStream = "";
         $defaultSubStream = "";
@@ -1279,8 +1247,8 @@ try
             if ( -not $ttl_duration )
             {
                 Write-Debug "ttl_duration zero"
-                # ttl_duration = [TimeSpan]( &"$($script:ffmpeg_path)\ffprobe.exe"    $_.FullName   -v error -hide_banner -analyzeduration 4GB -probesize 4GB -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 -sexagesimal | Out-String );      
-                if ( [TimeSpan]::TryParse((  &"$($script:ffmpeg_path)\ffprobe.exe" "$($_.FullName)" -v error -hide_banner -analyzeduration 4GB -probesize 4GB -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 -sexagesimal | Out-String), [ref]$ttl_duration ))
+                # ttl_duration = [TimeSpan]( &"$($script:ffprobe_exec)"    $_.FullName   -v error -hide_banner -analyzeduration 4GB -probesize 4GB -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 -sexagesimal | Out-String );      
+                if ( [TimeSpan]::TryParse((  &"$($script:ffprobe_exec)" "$($_.FullName)" -v error -hide_banner -analyzeduration 4GB -probesize 4GB -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 -sexagesimal | Out-String), [ref]$ttl_duration ))
                 {
                     $Matches.Clear();
                 }
@@ -1301,7 +1269,7 @@ try
                 if ( $ShowOutputCmd )
                 {
                     Write-Host
-                    Write-Log -Message "$($script:ffmpeg_path)\ffprobe.exe '$($_.FullName)' -v error -hide_banner -analyzeduration 4GB -probesize 4GB -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 -sexagesimal";
+                    Write-Log -Message "$($script:ffprobe_exec) '$($_.FullName)' -v error -hide_banner -analyzeduration 4GB -probesize 4GB -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 -sexagesimal";
                     Write-Host
                 }
             }
@@ -1367,7 +1335,7 @@ try
         }
         else 
         {
-            $SrcRes = ( &"$($script:ffmpeg_path)\ffprobe.exe" "$($_.FullName)" -v quiet -hide_banner -analyzeduration 4GB -probesize 4GB -select_streams v:0 -show_entries stream=width, height -of csv=s=x:p=0 | Out-String ).Trim();
+            $SrcRes = ( &"$($script:ffprobe_exec)" "$($_.FullName)" -v quiet -hide_banner -analyzeduration 4GB -probesize 4GB -select_streams v:0 -show_entries stream=width, height -of csv=s=x:p=0 | Out-String ).Trim();
             $SrcIsResMatched = $SrcRes -Match '(?<width>\d+)x(?<height>\d+)';
 
             if ( $SrcIsResMatched -eq $true )
@@ -1379,7 +1347,7 @@ try
             if ( $ShowOutputCmd )
             {
                 Write-Host
-                Write-Log -Message "$($script:ffmpeg_path)\ffprobe.exe '$($_.FullName)' -v quiet -hide_banner -analyzeduration 4GB -probesize 4GB -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0";
+                Write-Log -Message "$($script:ffprobe_exec) '$($_.FullName)' -v quiet -hide_banner -analyzeduration 4GB -probesize 4GB -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0";
                 Write-Host
             }
         }
@@ -1564,7 +1532,7 @@ try
         }
         else
         {
-            $sacdn = ( &"$($script:ffmpeg_path)\ffprobe.exe" $_.FullName -v quiet -hide_banner -analyzeduration 4GB -probesize 4GB -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 | Out-String ).Trim();
+            $sacdn = ( &"$($script:ffprobe_exec)" $_.FullName -v quiet -hide_banner -analyzeduration 4GB -probesize 4GB -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 | Out-String ).Trim();
         }
         if ( $sacdn -ieq "wmapro" )
         {
@@ -1637,14 +1605,14 @@ try
                 $test = New-Object System.Diagnostics.Process
             }
 
-            $test.StartInfo.FileName = "$($script:ffmpeg_path)\ffmpeg.exe"
+            $test.StartInfo.FileName = "$($script:ffmpeg_exec"
             $test.StartInfo.Arguments = "$($test_args)"
             $test.StartInfo.UseShellExecute = $false
             $test.StartInfo.RedirectStandardError = $true
             $test.StartInfo.RedirectStandardOutput = $false
             $test.StartInfo.CreateNoWindow = $true
 
-            Write-Log -Message "Test Command: $($script:ffmpeg_path)\ffmpeg.exe $($test_args)" -Target File;
+            Write-Log -Message "Test Command: $($script:ffmpeg_exec) $($test_args)" -Target File;
 
             $test.Start() | Out-Null
 
@@ -1695,14 +1663,14 @@ try
         {
             Write-Log "Exit Code: $exitCode"
             Write-Log -Message "Test Command failed after $maxRetries attempts.";
-            Write-Log -Message "$($script:ffmpeg_path)\ffmpeg.exe $($test_args)";
+            Write-Log -Message "$($script:ffmpeg_exec) $($test_args)";
             return
         }
 
         if ( $ShowOutputCmd )
         {
             Write-Host
-            Write-Log -Message "Run  Command: $($script:ffmpeg_path)\ffmpeg.exe $($hevc_nvenc_args)" -Target Host;
+            Write-Log -Message "Run  Command: $($script:ffmpeg_exec) $($hevc_nvenc_args)" -Target Host;
             Write-Host
         }
 
@@ -1711,9 +1679,9 @@ try
             $process = New-Object System.Diagnostics.Process;
             try
             {
-                Write-Log -Message "Run  Command: $($script:ffmpeg_path)\ffmpeg.exe $($hevc_nvenc_args)" -Target File;
+                Write-Log -Message "Run  Command: $($script:ffmpeg_exec) $($hevc_nvenc_args)" -Target File;
 
-                $process.StartInfo.Filename = "$($script:ffmpeg_path)\ffmpeg.exe";
+                $process.StartInfo.Filename = "$($script:ffmpeg_exec)";
                 $process.StartInfo.Arguments = "$($hevc_nvenc_args)";
                 $process.StartInfo.UseShellExecute = $false;
                 $process.StartInfo.RedirectStandardError = $true;
@@ -1822,12 +1790,16 @@ try
                         }
                     }
 
-                    # if (([System.Console]::ReadKey()).Key -eq "Q" )
-                    # {
-                    #   $process.Kill();
-                    #   $LASTEXITCODE = -1;
-                    #   Return;
-                    # }
+                    if ($Host.UI.RawUI.KeyAvailable)
+                    {
+                        $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+                        if ($key.Character -ieq "q")
+                        {
+                            $process.Kill()
+                            $LASTEXITCODE = -1
+                            return
+                        }
+                    }
                 }        
         
                 $process.WaitForExit();
@@ -1860,7 +1832,7 @@ try
                             # If the processed file is greater than 100KB
                             if ( $new_file_length -gt 100KB )
                             {
-                                $new_vid_stream_info = ((&"$($script:ffmpeg_path)\ffprobe.exe" $($new_file) -v quiet -hide_banner -analyzeduration 4GB -probesize 4GB -select_streams v:0 -show_streams | Out-String ).Trim());
+                                $new_vid_stream_info = ((&"$($script:ffprobe_exec)" $($new_file) -v quiet -hide_banner -analyzeduration 4GB -probesize 4GB -select_streams v:0 -show_streams | Out-String ).Trim());
 
                                 if ( $new_vid_stream_info )
                                 {
@@ -2017,7 +1989,7 @@ try
       
             try
             {
-                Invoke-Expression "$($script:ffmpeg_path)\ffmpeg.exe $($hevc_nvenc_args)";
+                Invoke-Expression "$($script:ffmpeg_exec) $($hevc_nvenc_args)";
             }
             finally
             {
@@ -2033,7 +2005,7 @@ try
                     # If the processed file is greater than 100KB
                     if ( $new_file_length -gt 100KB )
                     {
-                        $new_vid_stream_info = ((&"$($script:ffmpeg_path)\ffprobe.exe" $($new_file) -v quiet -hide_banner -analyzeduration 4GB -probesize 4GB -select_streams v:0 -show_streams | Out-String ).Trim());
+                        $new_vid_stream_info = ((&"$($script:ffprobe_exec)" $($new_file) -v quiet -hide_banner -analyzeduration 4GB -probesize 4GB -select_streams v:0 -show_streams | Out-String ).Trim());
 
                         if ( $new_vid_stream_info )
                         {
@@ -2180,9 +2152,7 @@ try
         }
         catch 
         {
-            # Write-Host
-            # Write-Host "Start: $($start)"
-            # Write-Host "Stop: $($stop)"
+            # Handle silently
         }
     }
 }
