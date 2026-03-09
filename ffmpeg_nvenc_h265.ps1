@@ -233,7 +233,7 @@ foreach ($location in $configLocations) {
   }
 }
 
-$script:ffmpeg_path = Get-ConfigValue -ConfigKey "ffmpeg_path" -EnvVarName "FFENC_PATH" -ConfigData $configData
+$script:ffmpeg_path = Get-ConfigValue -ConfigKey "ffmpeg_path" -EnvVarName "FFENC_FFMPEG_PATH" -ConfigData $configData
 $script:log_path = Get-OptionalConfigValue -ConfigKey "log_path" -EnvVarName "FFENC_LOG_PATH" -ConfigData $configData
 if ([string]::IsNullOrWhiteSpace([string]$script:log_path)) {
   $script:log_path = Resolve-DiscoveredLogPath -SearchLocations $configLocations -LoadedConfigDirectory $loadedConfigDirectory
@@ -270,11 +270,11 @@ elseif ((Split-Path -Path $script:ffmpeg_path -Leaf) -ieq $ffmpegExeName) {
 else { $script:ffprobe_exe = Join-Path $script:ffmpeg_path $ffprobeExeName }
 
 if (-not (Test-Path -LiteralPath $script:ffmpeg_exe)) {
-  throw "ffmpeg executable was not found at '$($script:ffmpeg_exe)'. Set ffmpeg_path (or FFENC_PATH) to the ffmpeg directory or full executable path."
+  throw "ffmpeg executable was not found at '$($script:ffmpeg_exe)'. Set ffmpeg_path (or FFENC_FFMPEG_PATH) to the ffmpeg directory or full executable path."
 }
 
 if (-not (Test-Path -LiteralPath $script:ffprobe_exe)) {
-  throw "ffprobe executable was not found at '$($script:ffprobe_exe)'. Set ffmpeg_path (or FFENC_PATH) to the ffmpeg directory or full executable path."
+  throw "ffprobe executable was not found at '$($script:ffprobe_exe)'. Set ffmpeg_path (or FFENC_FFMPEG_PATH) to the ffmpeg directory or full executable path."
 }
 
 if (-not (Test-Path -LiteralPath $script:log_path)) {

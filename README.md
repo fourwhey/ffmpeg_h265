@@ -97,7 +97,7 @@ If both are missing/empty, the script fails fast (except `log_path`, which has d
 
 Mapping:
 
-- `ffmpeg_path` → `FFENC_PATH`
+- `ffmpeg_path` → `FFENC_FFMPEG_PATH`
 - `log_path` (optional) → `FFENC_LOG_PATH`
 - `processed_path` → `FFENC_PROCESSED_PATH`
 - `processing_path` → `FFENC_PROCESSING_PATH`
