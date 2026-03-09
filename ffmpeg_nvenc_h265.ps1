@@ -894,11 +894,15 @@ function Get-ArrContext {
     }
   }
 
-  return @{
-    Type    = [ArrType]::series
-    BaseUri = $sonarr_baseUri
-    ApiKey  = $sonarr_apiKey
+  if (Test-PathIsUnder -ChildPath $SourceFile.FullName -ParentPath $tv_shows_path) {
+    return @{
+      Type    = [ArrType]::series
+      BaseUri = $sonarr_baseUri
+      ApiKey  = $sonarr_apiKey
+    }
   }
+
+  return $null
 }
 
 function Invoke-ArrRefresh {
@@ -1339,8 +1343,13 @@ function Complete-JobFinalization {
       if ($RefreshArrOnCompletion) {
         $JobState.Status = "Refreshing Arr..."
         $arr = Get-ArrContext -SourceFile $srcFile
-        $titleName = (($arr.Type -eq [ArrType]::series -or $srcFile.Directory.Name.ToLower().StartsWith("season")) ? $srcFile.Directory.Parent.Name : $srcFile.Directory.Name)
-        Invoke-ArrRefresh -Type $arr.Type -TitleName $titleName -BaseUri $arr.BaseUri -ApiKey $arr.ApiKey -JobId $JobId
+        if (-not $arr) {
+          Write-ParallelLog -Message "Skipping Arr refresh: source path '$($srcFile.FullName)' is outside configured movies_path '$movies_path' and tv_shows_path '$tv_shows_path'." -Level Warning -Target Both -JobId $JobId
+        }
+        else {
+          $titleName = (($arr.Type -eq [ArrType]::series -or $srcFile.Directory.Name.ToLower().StartsWith("season")) ? $srcFile.Directory.Parent.Name : $srcFile.Directory.Name)
+          Invoke-ArrRefresh -Type $arr.Type -TitleName $titleName -BaseUri $arr.BaseUri -ApiKey $arr.ApiKey -JobId $JobId
+        }
       }
 
       $JobState.Status = "Completed (output larger)"
@@ -1364,8 +1373,13 @@ function Complete-JobFinalization {
     if ($RefreshArrOnCompletion) {
       $JobState.Status = "Refreshing Arr..."
       $arr = Get-ArrContext -SourceFile $srcFile
-      $titleName = (($arr.Type -eq [ArrType]::series -or $srcFile.Directory.Name.ToLower().StartsWith("season")) ? $srcFile.Directory.Parent.Name : $srcFile.Directory.Name)
-      Invoke-ArrRefresh -Type $arr.Type -TitleName $titleName -BaseUri $arr.BaseUri -ApiKey $arr.ApiKey -JobId $JobId
+      if (-not $arr) {
+        Write-ParallelLog -Message "Skipping Arr refresh: source path '$($srcFile.FullName)' is outside configured movies_path '$movies_path' and tv_shows_path '$tv_shows_path'." -Level Warning -Target Both -JobId $JobId
+      }
+      else {
+        $titleName = (($arr.Type -eq [ArrType]::series -or $srcFile.Directory.Name.ToLower().StartsWith("season")) ? $srcFile.Directory.Parent.Name : $srcFile.Directory.Name)
+        Invoke-ArrRefresh -Type $arr.Type -TitleName $titleName -BaseUri $arr.BaseUri -ApiKey $arr.ApiKey -JobId $JobId
+      }
     }
 
     $JobState.Status = "Completed"
