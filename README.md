@@ -13,7 +13,7 @@ This script automates the batch conversion of video files to H.265 format using 
 
 ## Key Features
 
-- **Parallel Processing**: Run up to 8 concurrent encoding jobs (default: 3)
+- **Parallel Processing**: Run up to 4 concurrent encoding jobs (default: 3)
 - **Real-time Progress Tracking**: Per-job progress bars showing encoding speed, completion percentage, and ETA
 - **Smart Video Analysis**: Automatic detection of video properties (resolution, codec, audio/subtitle streams)
 - **Flexible Resizing**: Scale videos to specific resolutions with aspect ratio preservation
@@ -241,7 +241,7 @@ Use environment variables as primary config (checked first), with ConfigPath as 
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `-MaxParallelJobs` | int | 3 | Maximum number of concurrent encoding jobs (1-8) |
+| `-MaxParallelJobs` | int | 3 | Maximum number of concurrent encoding jobs (1-4). Values above 4 are clamped to 4. |
 | `-ShowOutputCmd` | switch | false | Display FFmpeg commands being executed |
 | `-NoProgress` | switch | false | Disable progress bars |
 | `-ResizeResolution` | string | "" | Target resolution (e.g., "1920:1080") |
