@@ -1,0 +1,11 @@
+{
+  "ffmpeg_path": "C:\\ffmpeg",
+  "log_dir": "V:\\Logs\\ffmpeg_nvenc_h265",
+  "processed_path": "V:\\Processed",
+  "processing_temp": "V:\\ProcessingTemp",
+  "media_path": "V:\\Media",
+  "radarr_baseUri": "http://localhost:7878",
+  "radarr_apiKey": "your-radarr-api-key-here",
+  "sonarr_baseUri": "http://localhost:8989",
+  "sonarr_apiKey": "your-sonarr-api-key-here"
+}
