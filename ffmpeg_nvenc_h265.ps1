@@ -201,10 +201,9 @@ if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
   $configLocations = @($ConfigPath)
 }
 else {
-  # Auto-discovery: current dir, Documents (including OneDrive), script root
+  # Auto-discovery: current dir, script root
   $configLocations = @(
     $PWD.Path,
-    [Environment]::GetFolderPath('MyDocuments'),
     $script:ScriptRoot
   )
 }
@@ -245,13 +244,9 @@ $radarr_apiKey = Get-ConfigValue -ConfigKey "radarr_apiKey" -EnvVarName "RADARR_
 $sonarr_baseUri = Get-ConfigValue -ConfigKey "sonarr_baseUri" -EnvVarName "SONARR_BASE_URI" -ConfigData $configData
 $sonarr_apiKey = Get-ConfigValue -ConfigKey "sonarr_apiKey" -EnvVarName "SONARR_API_KEY" -ConfigData $configData
 
-$script:NullDevice = if ($IsWindows) { 'NUL' }
-else { '/dev/null' }
-
-$ffmpegExeName = if ($IsWindows) { 'ffmpeg.exe' }
-else { 'ffmpeg' }
-$ffprobeExeName = if ($IsWindows) { 'ffprobe.exe' }
-else { 'ffprobe' }
+$script:NullDevice = if ($IsWindows) { 'NUL' } else { '/dev/null' }
+$ffmpegExeName = if ($IsWindows) { 'ffmpeg.exe' } else { 'ffmpeg' }
+$ffprobeExeName = if ($IsWindows) { 'ffprobe.exe' } else { 'ffprobe' }
 
 if ((Split-Path -Path $script:ffmpeg_path -Leaf) -ieq $ffmpegExeName) {
   $script:ffmpeg_exe = $script:ffmpeg_path

@@ -47,7 +47,7 @@ For environment/deployment settings, precedence is always:
 2. Config file value
 3. Fail fast for required settings
 
-For `log_path`, step 3 is different: if missing from env/config, the script falls back to config discovery locations (loaded config directory, then current directory, Documents, script directory).
+For `log_path`, step 3 is different: if missing from env/config, the script falls back to config discovery locations (loaded config directory, then current directory, then script directory).
 
 `-ConfigPath` is the only configuration-related parameter and only controls where config is loaded from.
 
@@ -57,8 +57,7 @@ Create a `ffmpeg_nvenc_h265.config.json` file with your settings. The script sea
 
 1. **Explicit path** - Use `-ConfigPath` parameter to specify location
 2. **Current directory** - Where you run the script from
-3. **Documents folder** - `~\Documents` or `~\OneDrive\Documents`
-4. **Script directory** - Where the `.ps1` file is located
+3. **Script directory** - Where the `.ps1` file is located
 
 **Example ffmpeg_nvenc_h265.config.json:**
 
