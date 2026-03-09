@@ -180,9 +180,7 @@ function Resolve-DiscoveredLogPath {
     [Parameter(Mandatory = $false)][string]$LoadedConfigDirectory
   )
 
-  if (-not [string]::IsNullOrWhiteSpace($LoadedConfigDirectory)) {
-    return $LoadedConfigDirectory
-  }
+  if (-not [string]::IsNullOrWhiteSpace($LoadedConfigDirectory)) { return $LoadedConfigDirectory }
 
   foreach ($location in $SearchLocations) {
     if ([string]::IsNullOrWhiteSpace($location)) { continue }
@@ -258,9 +256,7 @@ else { 'ffprobe' }
 if ((Split-Path -Path $script:ffmpeg_path -Leaf) -ieq $ffmpegExeName) {
   $script:ffmpeg_exe = $script:ffmpeg_path
 }
-else {
-  $script:ffmpeg_exe = Join-Path $script:ffmpeg_path $ffmpegExeName
-}
+else { $script:ffmpeg_exe = Join-Path $script:ffmpeg_path $ffmpegExeName }
 
 if ((Split-Path -Path $script:ffmpeg_path -Leaf) -ieq $ffprobeExeName) {
   $script:ffprobe_exe = $script:ffmpeg_path
@@ -268,9 +264,7 @@ if ((Split-Path -Path $script:ffmpeg_path -Leaf) -ieq $ffprobeExeName) {
 elseif ((Split-Path -Path $script:ffmpeg_path -Leaf) -ieq $ffmpegExeName) {
   $script:ffprobe_exe = Join-Path (Split-Path -Parent $script:ffmpeg_path) $ffprobeExeName
 }
-else {
-  $script:ffprobe_exe = Join-Path $script:ffmpeg_path $ffprobeExeName
-}
+else { $script:ffprobe_exe = Join-Path $script:ffmpeg_path $ffprobeExeName }
 
 if (-not (Test-Path -LiteralPath $script:ffmpeg_exe)) {
   throw "ffmpeg executable was not found at '$($script:ffmpeg_exe)'. Set ffmpeg_path (or FFMPEG_PATH) to the ffmpeg directory or full executable path."
@@ -559,7 +553,9 @@ function Get-ScaleArgument {
 
   $w = 0
   $h = 0
-  if ((-not [int]::TryParse($parts[0], [ref]$w)) -or (-not [int]::TryParse($parts[1], [ref]$h))) { return "" }
+  if ((-not [int]::TryParse($parts[0], [ref]$w)) -or (-not [int]::TryParse($parts[1], [ref]$h))) { 
+    return "" 
+  }
 
   if ($RetainAspectValue) { return "-vf scale_cuda=${w}:-1:interp_algo=lanczos" }
 
@@ -576,7 +572,9 @@ function Get-TargetResolution {
 
   $w = 0
   $h = 0
-  if ((-not [int]::TryParse($parts[0], [ref]$w)) -or (-not [int]::TryParse($parts[1], [ref]$h))) { return $null }
+  if ((-not [int]::TryParse($parts[0], [ref]$w)) -or (-not [int]::TryParse($parts[1], [ref]$h))) { 
+    return $null 
+  }
 
   return [PSCustomObject]@{
     Width  = $w
@@ -714,9 +712,7 @@ function Invoke-EncodeTestWithFallback {
     try { $err = $stderrTask.GetAwaiter().GetResult().Trim() }
     catch { $err = "" }
     $errSummary = "Unknown ffmpeg test error"
-    if (-not [string]::IsNullOrWhiteSpace($err)) {
-      $errSummary = ($err -split "`r?`n")[0].Trim()
-    }
+    if (-not [string]::IsNullOrWhiteSpace($err)) { $errSummary = ($err -split "`r?`n")[0].Trim() }
 
     Write-ParallelLog -Message "Test command failed (attempt $retry/$maxRetries): $errSummary" -Level Warning -Target Both -JobId $JobId
 
