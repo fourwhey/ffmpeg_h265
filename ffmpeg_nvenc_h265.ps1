@@ -196,6 +196,14 @@ $configData = $null
 $configLocations = @()
 $loadedConfigDirectory = $null
 
+# Check for FFENC_CONFIGPATH environment variable if ConfigPath not explicitly provided
+if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+  $envConfigPath = [Environment]::GetEnvironmentVariable('FFENC_CONFIGPATH')
+  if (-not [string]::IsNullOrWhiteSpace($envConfigPath)) {
+    $ConfigPath = $envConfigPath
+  }
+}
+
 if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
   # Explicit ConfigPath overrides all discovery
   $configLocations = @($ConfigPath)
@@ -225,16 +233,16 @@ foreach ($location in $configLocations) {
   }
 }
 
-$script:ffmpeg_path = Get-ConfigValue -ConfigKey "ffmpeg_path" -EnvVarName "FFMPEG_PATH" -ConfigData $configData
-$script:log_path = Get-OptionalConfigValue -ConfigKey "log_path" -EnvVarName "FFMPEG_LOG_PATH" -ConfigData $configData
+$script:ffmpeg_path = Get-ConfigValue -ConfigKey "ffmpeg_path" -EnvVarName "FFENC_PATH" -ConfigData $configData
+$script:log_path = Get-OptionalConfigValue -ConfigKey "log_path" -EnvVarName "FFENC_LOG_PATH" -ConfigData $configData
 if ([string]::IsNullOrWhiteSpace([string]$script:log_path)) {
   $script:log_path = Resolve-DiscoveredLogPath -SearchLocations $configLocations -LoadedConfigDirectory $loadedConfigDirectory
 }
-$processed_path = Get-ConfigValue -ConfigKey "processed_path" -EnvVarName "FFMPEG_PROCESSED_PATH" -ConfigData $configData
-$processing_path = Get-ConfigValue -ConfigKey "processing_path" -EnvVarName "FFMPEG_PROCESSING_PATH" -ConfigData $configData
-$media_path = Get-ConfigValue -ConfigKey "media_path" -EnvVarName "FFMPEG_MEDIA_PATH" -ConfigData $configData
-$moviesSubfolder = Get-OptionalConfigValue -ConfigKey "movies_subfolder" -EnvVarName "FFMPEG_MOVIES_SUBFOLDER" -ConfigData $configData
-$tvShowsSubfolder = Get-OptionalConfigValue -ConfigKey "tv_shows_subfolder" -EnvVarName "FFMPEG_TV_SHOWS_SUBFOLDER" -ConfigData $configData
+$processed_path = Get-ConfigValue -ConfigKey "processed_path" -EnvVarName "FFENC_PROCESSED_PATH" -ConfigData $configData
+$processing_path = Get-ConfigValue -ConfigKey "processing_path" -EnvVarName "FFENC_PROCESSING_PATH" -ConfigData $configData
+$media_path = Get-ConfigValue -ConfigKey "media_path" -EnvVarName "FFENC_MEDIA_PATH" -ConfigData $configData
+$moviesSubfolder = Get-OptionalConfigValue -ConfigKey "movies_subfolder" -EnvVarName "FFENC_MOVIES_SUBFOLDER" -ConfigData $configData
+$tvShowsSubfolder = Get-OptionalConfigValue -ConfigKey "tv_shows_subfolder" -EnvVarName "FFENC_TV_SHOWS_SUBFOLDER" -ConfigData $configData
 if ([string]::IsNullOrWhiteSpace([string]$moviesSubfolder)) { $moviesSubfolder = "Movies" }
 if ([string]::IsNullOrWhiteSpace([string]$tvShowsSubfolder)) { $tvShowsSubfolder = "TV Shows" }
 $tv_shows_path = Join-Path $media_path $tvShowsSubfolder
@@ -262,11 +270,11 @@ elseif ((Split-Path -Path $script:ffmpeg_path -Leaf) -ieq $ffmpegExeName) {
 else { $script:ffprobe_exe = Join-Path $script:ffmpeg_path $ffprobeExeName }
 
 if (-not (Test-Path -LiteralPath $script:ffmpeg_exe)) {
-  throw "ffmpeg executable was not found at '$($script:ffmpeg_exe)'. Set ffmpeg_path (or FFMPEG_PATH) to the ffmpeg directory or full executable path."
+  throw "ffmpeg executable was not found at '$($script:ffmpeg_exe)'. Set ffmpeg_path (or FFENC_PATH) to the ffmpeg directory or full executable path."
 }
 
 if (-not (Test-Path -LiteralPath $script:ffprobe_exe)) {
-  throw "ffprobe executable was not found at '$($script:ffprobe_exe)'. Set ffmpeg_path (or FFMPEG_PATH) to the ffmpeg directory or full executable path."
+  throw "ffprobe executable was not found at '$($script:ffprobe_exe)'. Set ffmpeg_path (or FFENC_PATH) to the ffmpeg directory or full executable path."
 }
 
 if (-not (Test-Path -LiteralPath $script:log_path)) {

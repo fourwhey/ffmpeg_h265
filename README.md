@@ -97,17 +97,18 @@ If both are missing/empty, the script fails fast (except `log_path`, which has d
 
 Mapping:
 
-- `ffmpeg_path` → `FFMPEG_PATH`
-- `log_path` (optional) → `FFMPEG_LOG_PATH`
-- `processed_path` → `FFMPEG_PROCESSED_PATH`
-- `processing_path` → `FFMPEG_PROCESSING_PATH`
-- `media_path` → `FFMPEG_MEDIA_PATH`
-- `movies_subfolder` (optional) → `FFMPEG_MOVIES_SUBFOLDER`
-- `tv_shows_subfolder` (optional) → `FFMPEG_TV_SHOWS_SUBFOLDER`
+- `ffmpeg_path` → `FFENC_PATH`
+- `log_path` (optional) → `FFENC_LOG_PATH`
+- `processed_path` → `FFENC_PROCESSED_PATH`
+- `processing_path` → `FFENC_PROCESSING_PATH`
+- `media_path` → `FFENC_MEDIA_PATH`
+- `movies_subfolder` (optional) → `FFENC_MOVIES_SUBFOLDER`
+- `tv_shows_subfolder` (optional) → `FFENC_TV_SHOWS_SUBFOLDER`
 - `radarr_baseUri` → `RADARR_BASE_URI`
 - `radarr_apiKey` → `RADARR_API_KEY`
 - `sonarr_baseUri` → `SONARR_BASE_URI`
 - `sonarr_apiKey` → `SONARR_API_KEY`
+- `-ConfigPath` parameter (optional) → `FFENC_CONFIGPATH`
 
 ### ConfigPath Parameter
 
@@ -118,6 +119,15 @@ Explicitly specify where to load ffmpeg_nvenc_h265.config.json from:
 ```
 
 This overrides automatic discovery and only looks in the specified directory.
+
+Alternatively, set the `FFENC_CONFIGPATH` environment variable to avoid passing the parameter each time:
+
+```powershell
+$env:FFENC_CONFIGPATH = "C:\MyConfigs"
+.\ffmpeg_nvenc_h265.ps1 -Path "C:\Videos"
+```
+
+The `-ConfigPath` parameter takes precedence over the environment variable if both are set.
 
 ## Usage
 
