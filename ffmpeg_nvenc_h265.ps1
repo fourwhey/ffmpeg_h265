@@ -1,18 +1,17 @@
 <#
 .SYNOPSIS
-  Parallel ffmpeg+NVENC conversion with bounded concurrency and per-job progress.
+  Parallel ffmpeg + NVENC conversion with bounded concurrency and per-job progress.
 .DESCRIPTION
   Discovers files, precomputes encode work items, and runs up to -MaxParallelJobs ffmpeg
   processes concurrently. Uses a synchronized hashtable for progress state and renders
   a parent + per-job Write-Progress display. Logging is job-scoped and thread-safe.
-
-  This script intentionally keeps all work in ffmpeg_nvenc_h265.ps1 and does
-  not modify ffmpeg_nvenc_h265.ps1.
 #>
 
 param(
+  # Runtime-scope parameters belong here (scan behavior, filters, encoding, logging toggles).
+  # Environment/deployment settings (paths, endpoints, API keys) are intentionally
+  # resolved from env/config to avoid a duplicated parameter surface.
   [Parameter(Mandatory = $true)][string] $Path,
-  [Parameter(Mandatory = $false, HelpMessage = "movies or tvshows")][string] $RootPath,
   [Parameter(Mandatory = $false)][int] $MaxParallelJobs = 3,
   [Parameter(Mandatory = $false)][switch] $ShowOutputCmd,
   [Parameter(Mandatory = $false)][switch] $NoProgress,
@@ -36,7 +35,7 @@ param(
   [Parameter(Mandatory = $false)][string] $SubLang = "eng",
   [Parameter(Mandatory = $false)][datetime] $LastRunDate,
   [Parameter(Mandatory = $false)][switch] $SkipFileLock = $false,
-  [Parameter(Mandatory = $false, HelpMessage = "Directory containing ffmpeg_nvenc_h265.config.json")][string] $ConfigDir = ""
+  [Parameter(Mandatory = $false, HelpMessage = "Directory containing ffmpeg_nvenc_h265.config.json")][string] $ConfigPath = ""
 )
 
 $ShowProgress = -not $NoProgress.IsPresent
@@ -69,7 +68,6 @@ if ($PSVersionTable.PSVersion -lt [version]'7.5.0') {
 # Snapshot script parameters so compatibility options are explicitly represented and traceable.
 $script:RunConfig = [ordered]@{
   Path                 = $Path
-  RootPath             = $RootPath
   MaxParallelJobs      = $MaxParallelJobs
   ShowOutputCmd        = $ShowOutputCmd.IsPresent
   NoProgress           = $NoProgress.IsPresent
@@ -93,7 +91,7 @@ $script:RunConfig = [ordered]@{
   SubLang              = $SubLang
   LastRunDate          = $LastRunDate
   SkipFileLock         = $SkipFileLock.IsPresent
-  ConfigDir            = $ConfigDir
+  ConfigPath           = $ConfigPath
 }
 
 if (-not [int]::TryParse($CQPRateControl, [ref]$script:CQPRateControlInt)) {
@@ -131,10 +129,15 @@ if (-not $script:ScriptRoot) {
 
 $script:logFileName = "ffmpeg_nvenc_h265_$(Get-Date -Format "yyyyMMddHHmmssffff").log"
 $script:logFilePath = $null
-$script:LogMutexName = "Global\ffmpeg_nvenc_h265_log"
+$script:LogMutexName = if ($IsWindows) { "Global\ffmpeg_nvenc_h265_log" }
+else { "ffmpeg_nvenc_h265_log" }
 $script:LogMutex = $null
 
 # Configuration values are required, resolved as env var first, then config file.
+# Precedence for environment/deployment settings is:
+# 1) Environment variable
+# 2) Config file value
+# 3) Fail fast (for required keys)
 function Get-ConfigValue {
   param(
     [Parameter(Mandatory = $true)][string]$ConfigKey,
@@ -155,12 +158,49 @@ function Get-ConfigValue {
   return $value
 }
 
+function Get-OptionalConfigValue {
+  param(
+    [Parameter(Mandatory = $true)][string]$ConfigKey,
+    [Parameter(Mandatory = $true)][string]$EnvVarName,
+    [Parameter(Mandatory = $true)][object]$ConfigData
+  )
+
+  $value = [Environment]::GetEnvironmentVariable($EnvVarName)
+
+  if ([string]::IsNullOrWhiteSpace([string]$value) -and $ConfigData -and $ConfigData.PSObject.Properties[$ConfigKey]) {
+    $value = $ConfigData.$ConfigKey
+  }
+
+  return $value
+}
+
+function Resolve-DiscoveredLogPath {
+  param(
+    [Parameter(Mandatory = $true)][string[]]$SearchLocations,
+    [Parameter(Mandatory = $false)][string]$LoadedConfigDirectory
+  )
+
+  if (-not [string]::IsNullOrWhiteSpace($LoadedConfigDirectory)) {
+    return $LoadedConfigDirectory
+  }
+
+  foreach ($location in $SearchLocations) {
+    if ([string]::IsNullOrWhiteSpace($location)) { continue }
+    if (Test-Path -LiteralPath $location -PathType Container -ErrorAction SilentlyContinue) {
+      return $location
+    }
+  }
+
+  return $PWD.Path
+}
+
 $configData = $null
 $configLocations = @()
+$loadedConfigDirectory = $null
 
-if (-not [string]::IsNullOrWhiteSpace($ConfigDir)) {
-  # Explicit ConfigDir overrides all discovery
-  $configLocations = @($ConfigDir)
+if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
+  # Explicit ConfigPath overrides all discovery
+  $configLocations = @($ConfigPath)
 }
 else {
   # Auto-discovery: current dir, Documents (including OneDrive), script root
@@ -178,6 +218,7 @@ foreach ($location in $configLocations) {
   if (Test-Path -LiteralPath $configPath) {
     try {
       $configData = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+      $loadedConfigDirectory = Split-Path -Parent $configPath
       Write-Verbose "Loaded configuration from: $configPath"
       break
     }
@@ -188,22 +229,62 @@ foreach ($location in $configLocations) {
 }
 
 $script:ffmpeg_path = Get-ConfigValue -ConfigKey "ffmpeg_path" -EnvVarName "FFMPEG_PATH" -ConfigData $configData
-$script:log_dir = Get-ConfigValue -ConfigKey "log_dir" -EnvVarName "FFMPEG_LOG_DIR" -ConfigData $configData
+$script:log_path = Get-OptionalConfigValue -ConfigKey "log_path" -EnvVarName "FFMPEG_LOG_PATH" -ConfigData $configData
+if ([string]::IsNullOrWhiteSpace([string]$script:log_path)) {
+  $script:log_path = Resolve-DiscoveredLogPath -SearchLocations $configLocations -LoadedConfigDirectory $loadedConfigDirectory
+}
 $processed_path = Get-ConfigValue -ConfigKey "processed_path" -EnvVarName "FFMPEG_PROCESSED_PATH" -ConfigData $configData
-$processing_temp = Get-ConfigValue -ConfigKey "processing_temp" -EnvVarName "FFMPEG_PROCESSING_TEMP" -ConfigData $configData
+$processing_path = Get-ConfigValue -ConfigKey "processing_path" -EnvVarName "FFMPEG_PROCESSING_PATH" -ConfigData $configData
 $media_path = Get-ConfigValue -ConfigKey "media_path" -EnvVarName "FFMPEG_MEDIA_PATH" -ConfigData $configData
-$tv_shows_path = Join-Path $media_path "TV Shows"
-$movies_path = Join-Path $media_path "Movies"
+$moviesSubfolder = Get-OptionalConfigValue -ConfigKey "movies_subfolder" -EnvVarName "FFMPEG_MOVIES_SUBFOLDER" -ConfigData $configData
+$tvShowsSubfolder = Get-OptionalConfigValue -ConfigKey "tv_shows_subfolder" -EnvVarName "FFMPEG_TV_SHOWS_SUBFOLDER" -ConfigData $configData
+if ([string]::IsNullOrWhiteSpace([string]$moviesSubfolder)) { $moviesSubfolder = "Movies" }
+if ([string]::IsNullOrWhiteSpace([string]$tvShowsSubfolder)) { $tvShowsSubfolder = "TV Shows" }
+$tv_shows_path = Join-Path $media_path $tvShowsSubfolder
+$movies_path = Join-Path $media_path $moviesSubfolder
 $radarr_baseUri = Get-ConfigValue -ConfigKey "radarr_baseUri" -EnvVarName "RADARR_BASE_URI" -ConfigData $configData
 $radarr_apiKey = Get-ConfigValue -ConfigKey "radarr_apiKey" -EnvVarName "RADARR_API_KEY" -ConfigData $configData
 $sonarr_baseUri = Get-ConfigValue -ConfigKey "sonarr_baseUri" -EnvVarName "SONARR_BASE_URI" -ConfigData $configData
 $sonarr_apiKey = Get-ConfigValue -ConfigKey "sonarr_apiKey" -EnvVarName "SONARR_API_KEY" -ConfigData $configData
 
-if (-not (Test-Path -LiteralPath $script:log_dir)) {
-  New-Item -Path $script:log_dir -ItemType Directory -Force | Out-Null
+$script:NullDevice = if ($IsWindows) { 'NUL' }
+else { '/dev/null' }
+
+$ffmpegExeName = if ($IsWindows) { 'ffmpeg.exe' }
+else { 'ffmpeg' }
+$ffprobeExeName = if ($IsWindows) { 'ffprobe.exe' }
+else { 'ffprobe' }
+
+if ((Split-Path -Path $script:ffmpeg_path -Leaf) -ieq $ffmpegExeName) {
+  $script:ffmpeg_exe = $script:ffmpeg_path
+}
+else {
+  $script:ffmpeg_exe = Join-Path $script:ffmpeg_path $ffmpegExeName
 }
 
-$script:logFilePath = Join-Path $script:log_dir $script:logFileName
+if ((Split-Path -Path $script:ffmpeg_path -Leaf) -ieq $ffprobeExeName) {
+  $script:ffprobe_exe = $script:ffmpeg_path
+}
+elseif ((Split-Path -Path $script:ffmpeg_path -Leaf) -ieq $ffmpegExeName) {
+  $script:ffprobe_exe = Join-Path (Split-Path -Parent $script:ffmpeg_path) $ffprobeExeName
+}
+else {
+  $script:ffprobe_exe = Join-Path $script:ffmpeg_path $ffprobeExeName
+}
+
+if (-not (Test-Path -LiteralPath $script:ffmpeg_exe)) {
+  throw "ffmpeg executable was not found at '$($script:ffmpeg_exe)'. Set ffmpeg_path (or FFMPEG_PATH) to the ffmpeg directory or full executable path."
+}
+
+if (-not (Test-Path -LiteralPath $script:ffprobe_exe)) {
+  throw "ffprobe executable was not found at '$($script:ffprobe_exe)'. Set ffmpeg_path (or FFMPEG_PATH) to the ffmpeg directory or full executable path."
+}
+
+if (-not (Test-Path -LiteralPath $script:log_path)) {
+  New-Item -Path $script:log_path -ItemType Directory -Force | Out-Null
+}
+
+$script:logFilePath = Join-Path $script:log_path $script:logFileName
 
 enum LogLevel {
   Information = 0
@@ -329,7 +410,7 @@ function Get-FFprobeJson {
 
   if ($script:StopRequested -or $script:CancellationToken.IsCancellationRequested) { return $null }
 
-  $ffprobeExe = "$($script:ffmpeg_path)\ffprobe.exe"
+  $ffprobeExe = $script:ffprobe_exe
   $ffprobeArgs = "`"$InputPath`" -v quiet -hide_banner -analyzeduration 4GB -probesize 4GB -show_format -show_streams -print_format json -sexagesimal"
 
   $probeProcess = New-Object System.Diagnostics.Process
@@ -601,7 +682,8 @@ function Invoke-EncodeTestWithFallback {
     [Parameter(Mandatory = $true)][int]$JobId
   )
 
-  $testArgs = $FFmpegArgs.Replace('"' + $OutputFile + '"', '-ss 0 -to 10 -f null NUL')
+  $nullSinkArgs = "-ss 0 -to 10 -f null $($script:NullDevice)"
+  $testArgs = $FFmpegArgs.Replace('"' + $OutputFile + '"', $nullSinkArgs)
   $maxRetries = 3
   $retry = 1
 
@@ -609,7 +691,7 @@ function Invoke-EncodeTestWithFallback {
     Write-VerboseParallelLog -Message "Running ffmpeg test attempt $retry/$maxRetries with args: $testArgs" -JobId $JobId
 
     $p = New-Object System.Diagnostics.Process
-    $p.StartInfo.FileName = "$($script:ffmpeg_path)\ffmpeg.exe"
+    $p.StartInfo.FileName = $script:ffmpeg_exe
     $p.StartInfo.Arguments = $testArgs
     $p.StartInfo.UseShellExecute = $false
     $p.StartInfo.RedirectStandardOutput = $false
@@ -622,7 +704,7 @@ function Invoke-EncodeTestWithFallback {
     $exitCode = $p.ExitCode
 
     if ($exitCode -eq 0) {
-      $effectiveArgs = $testArgs.Replace('-ss 0 -to 10 -f null NUL', '"' + $OutputFile + '"')
+      $effectiveArgs = $testArgs.Replace($nullSinkArgs, '"' + $OutputFile + '"')
       Write-VerboseParallelLog -Message "ffmpeg test succeeded; effective encode args selected." -JobId $JobId
       Write-VerboseParallelLog -Message "Effective ffmpeg args: $effectiveArgs" -JobId $JobId
       return $effectiveArgs
@@ -690,9 +772,9 @@ function Get-OutputPath {
   $ext = ".mp4"
   if ($FileInfo.Extension -ieq ".mkv") { $ext = ".mkv" }
 
-  if ($IsReprocess) { return (Join-Path $processing_temp "$baseName $JobId.temp$ext") }
+  if ($IsReprocess) { return (Join-Path $processing_path "$baseName $JobId.temp$ext") }
 
-  return (Join-Path $processing_temp "$baseName - proc.$JobId.temp$ext")
+  return (Join-Path $processing_path "$baseName - proc.$JobId.temp$ext")
 }
 
 function Get-FinalOutputName {
@@ -717,25 +799,60 @@ function Get-FinalOutputName {
   return "$baseName - proc$ext"
 }
 
+function Get-NormalizedPath {
+  [OutputType([string])]
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  try { $fullPath = [System.IO.Path]::GetFullPath($Path) }
+  catch { $fullPath = $Path }
+
+  return $fullPath.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+}
+
+function Test-PathIsUnder {
+  [OutputType([bool])]
+  param(
+    [Parameter(Mandatory = $true)][string]$ChildPath,
+    [Parameter(Mandatory = $true)][string]$ParentPath
+  )
+
+  $normalizedChild = Get-NormalizedPath -Path $ChildPath
+  $normalizedParent = Get-NormalizedPath -Path $ParentPath
+
+  $comparison = if ($IsWindows) { [System.StringComparison]::OrdinalIgnoreCase }
+  else { [System.StringComparison]::Ordinal }
+
+  if ([string]::Equals($normalizedChild, $normalizedParent, $comparison)) { return $true }
+
+  $parentWithSeparator = $normalizedParent + [System.IO.Path]::DirectorySeparatorChar
+  return $normalizedChild.StartsWith($parentWithSeparator, $comparison)
+}
+
+function Get-ArchiveDirectory {
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory = $true)][string]$SourceDirectory,
+    [Parameter(Mandatory = $true)][string]$MediaRoot,
+    [Parameter(Mandatory = $true)][string]$ProcessedRoot
+  )
+
+  if (Test-PathIsUnder -ChildPath $SourceDirectory -ParentPath $MediaRoot) {
+    $relativePath = [System.IO.Path]::GetRelativePath((Get-NormalizedPath -Path $MediaRoot), (Get-NormalizedPath -Path $SourceDirectory))
+    if (($relativePath -eq '.') -or [string]::IsNullOrWhiteSpace($relativePath)) {
+      return $ProcessedRoot
+    }
+
+    return Join-Path $ProcessedRoot $relativePath
+  }
+
+  # Fallback if source path is outside configured media root.
+  return Join-Path $ProcessedRoot (Split-Path -Leaf $SourceDirectory)
+}
+
 function Get-InputItemList {
   param([string]$InputPath)
 
   $pathForScan = $InputPath
-  $rootPathNormalized = ""
-  if (-not [string]::IsNullOrWhiteSpace($RootPath)) {
-    $rootPathNormalized = $RootPath.Trim().ToLower()
-  }
-
-  if ($rootPathNormalized -eq 'movies') {
-    $pathForScan = Join-Path $movies_path $InputPath
-  }
-  elseif ($rootPathNormalized -eq 'tvshows') {
-    $pathForScan = Join-Path $tv_shows_path $InputPath
-  }
-  elseif (-not [string]::IsNullOrWhiteSpace($RootPath)) {
-    Write-ParallelLog -Message "RootPath '$RootPath' is not recognized (expected 'movies' or 'tvshows'); using Path as provided." -Level Warning -Target Both
-  }
-
   $pathExistsLiteral = Test-Path -LiteralPath $pathForScan -ErrorAction SilentlyContinue
   $pathHasWildcard = [Management.Automation.WildcardPattern]::ContainsWildcardCharacters($pathForScan)
 
@@ -769,7 +886,7 @@ function Get-InputItemList {
 function Get-ArrContext {
   param([System.IO.FileInfo]$SourceFile)
 
-  if ($SourceFile.FullName.Contains($movies_path)) {
+  if (Test-PathIsUnder -ChildPath $SourceFile.FullName -ParentPath $movies_path) {
     return @{
       Type    = [ArrType]::movie
       BaseUri = $radarr_baseUri
@@ -876,11 +993,11 @@ function Start-EncodeProcess {
   Write-VerboseParallelLog -Message "Launching ffmpeg with args: $ffmpegArgs" -JobId $JobId
 
   if ($script:ShowOutputCmdEnabled) {
-    Write-ParallelLog -Message "Run Command: $($script:ffmpeg_path)\ffmpeg.exe $ffmpegArgs" -Target Both -JobId $JobId
+    Write-ParallelLog -Message "Run Command: $($script:ffmpeg_exe) $ffmpegArgs" -Target Both -JobId $JobId
   }
 
   $p = New-Object System.Diagnostics.Process
-  $p.StartInfo.FileName = "$($script:ffmpeg_path)\ffmpeg.exe"
+  $p.StartInfo.FileName = $script:ffmpeg_exe
   $p.StartInfo.Arguments = $ffmpegArgs
   $p.StartInfo.UseShellExecute = $false
   $p.StartInfo.RedirectStandardOutput = $true
@@ -902,7 +1019,7 @@ function Start-EncodeProcess {
   # Open a per-job progress dump file for raw postmortem analysis.
   if ($LogVerbose) {
     $dumpName = "ffmpeg_nvenc_h265_progress_job${JobId}_$(Get-Date -Format 'yyyyMMddHHmmss').log"
-    $dumpPath = Join-Path $script:log_dir $dumpName
+    $dumpPath = Join-Path $script:log_path $dumpName
     try {
       $sw = [System.IO.StreamWriter]::new($dumpPath, $false, [System.Text.Encoding]::UTF8)
       $sw.AutoFlush = $true
@@ -1230,8 +1347,8 @@ function Complete-JobFinalization {
       return
     }
 
-    $fullProcessedPath = ("$($srcFile.DirectoryName)\").Replace($media_path, $processed_path)
-    Write-ParallelLog -Message "Finalize paths:\n output='$($JobState.OutputFile)'\n final='$($JobState.FinalOutputFile)'\n archive='$fullProcessedPath'\n source='$($srcFile.FullName)'" -Target Log -JobId $JobId
+    $fullProcessedPath = Get-ArchiveDirectory -SourceDirectory $srcFile.DirectoryName -MediaRoot $media_path -ProcessedRoot $processed_path
+    Write-ParallelLog -Message "Finalize paths:`n output='$($JobState.OutputFile)'`n final='$($JobState.FinalOutputFile)'`n archive='$fullProcessedPath'`n source='$($srcFile.FullName)'" -Target Log -JobId $JobId
 
     if (-not (Test-Path -LiteralPath $fullProcessedPath)) {
       New-Item -Path $fullProcessedPath -ItemType Directory | Out-Null
@@ -1242,7 +1359,7 @@ function Complete-JobFinalization {
     Show-ParallelProgress -StateTable $StateTable -TotalCount $TotalCount
     Move-Item -LiteralPath $JobState.OutputFile -Destination $JobState.FinalOutputFile -Force
     Move-Item -LiteralPath $srcFile.FullName -Destination $fullProcessedPath -Force
-    Write-ParallelLog -Message "Moved output to: '$($JobState.FinalOutputFile)'\n Archived source to: '$fullProcessedPath'." -Target Both -JobId $JobId
+    Write-ParallelLog -Message "Moved output to: '$($JobState.FinalOutputFile)'`n Archived source to: '$fullProcessedPath'." -Target Both -JobId $JobId
 
     if ($RefreshArrOnCompletion) {
       $JobState.Status = "Refreshing Arr..."
@@ -1287,7 +1404,7 @@ function Get-QueuedWorkItem {
   $itdm = [Math]::Max(1, [int][Math]::Floor(($durationMs / 1000.0) / 60.0))
   $ismb = [int][Math]::Floor($Item.Length / 1MB)
   $impm = [int][Math]::Ceiling(($ismb / [decimal]$itdm))
-  $isMovieItem = $Item.FullName.Contains($movies_path)
+  $isMovieItem = Test-PathIsUnder -ChildPath $Item.FullName -ParentPath $movies_path
 
   if ((-not $ForceConvert) -and (((-not $isMovieItem) -and ($ismb -le 350)) -or ($isMovieItem -and ($ismb -le 900)))) {
     Write-VerboseParallelLog -Message "Skipping threshold floor: ismb=$ismb itdm=$itdm impm=$impm movie=$isMovieItem" -JobId $JobId
@@ -1548,8 +1665,8 @@ $runStarted = Get-Date
 Register-CancellationHandler
 
 # Clean up old log files (main logs and progress dumps).
-$logFilter = Join-Path $script:log_dir "ffmpeg_nvenc_h265_*.log"
-$progressFilter = Join-Path $script:log_dir "ffmpeg_nvenc_h265_progress_job*.log"
+$logFilter = Join-Path $script:log_path "ffmpeg_nvenc_h265_*.log"
+$progressFilter = Join-Path $script:log_path "ffmpeg_nvenc_h265_progress_job*.log"
 $oldLogs = @(Get-Item -Path $logFilter, $progressFilter -ErrorAction SilentlyContinue | Where-Object {
     $_.FullName -ne $script:logFilePath -and $_.CreationTime -lt (Get-Date).AddMinutes(-60)
   })
@@ -1587,8 +1704,8 @@ try {
 
   Write-ParallelLog -Message "Discovered $($items.Count) file(s). MaxParallelJobs=$MaxParallelJobs" -Target Both
 
-  if (-not (Test-Path -LiteralPath $processing_temp)) {
-    New-Item -Path $processing_temp -ItemType Directory | Out-Null
+  if (-not (Test-Path -LiteralPath $processing_path)) {
+    New-Item -Path $processing_path -ItemType Directory | Out-Null
   }
 
   # Shared synchronized state is owned by the host loop and read for progress rendering.
@@ -1599,9 +1716,7 @@ try {
   $script:PendingQueueRef = $pending
   $script:CandidateQueueRef = $candidates
 
-  foreach ($item in $items) {
-    $candidates.Enqueue($item)
-  }
+  foreach ($item in $items) { $candidates.Enqueue($item) }
 
   $nextId = 1
   $totalKnown = $items.Count

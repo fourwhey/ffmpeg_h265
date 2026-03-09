@@ -25,20 +25,37 @@ This script automates the batch conversion of video files to H.265 format using 
 ## Requirements
 
 - **PowerShell 7.5 or newer**
-- **FFmpeg**: With NVENC support (default location: `C:\ffmpeg`, configurable)
+- **FFmpeg/FFprobe**: Installed and reachable via `ffmpeg_path` (directory or full ffmpeg executable path)
 - **NVIDIA GPU**: With NVENC support for hardware encoding
-- **Windows OS**: Script designed for Windows environments
+- **OS**: Windows, Linux, or macOS with PowerShell 7.5+
 
 ## Configuration
 
 There are no built-in defaults for media paths, FFmpeg path, or Arr settings.
 Each required value is resolved in this order: matching environment variable, then config file value, then fail.
 
+### Configuration Surface Policy
+
+To keep behavior predictable and avoid drift, the script uses two distinct surfaces:
+
+- **Command parameters**: per-run behavior (what to scan, concurrency, filters, resize, logging switches)
+- **Environment/config values**: environment/deployment settings (paths, endpoints, API keys)
+
+For environment/deployment settings, precedence is always:
+
+1. Environment variable
+2. Config file value
+3. Fail fast for required settings
+
+For `log_path`, step 3 is different: if missing from env/config, the script falls back to config discovery locations (loaded config directory, then current directory, Documents, script directory).
+
+`-ConfigPath` is the only configuration-related parameter and only controls where config is loaded from.
+
 ### Config File (Optional Fallback)
 
 Create a `ffmpeg_nvenc_h265.config.json` file with your settings. The script searches for this file in:
 
-1. **Explicit path** - Use `-ConfigDir` parameter to specify location
+1. **Explicit path** - Use `-ConfigPath` parameter to specify location
 2. **Current directory** - Where you run the script from
 3. **Documents folder** - `~\Documents` or `~\OneDrive\Documents`
 4. **Script directory** - Where the `.ps1` file is located
@@ -48,10 +65,12 @@ Create a `ffmpeg_nvenc_h265.config.json` file with your settings. The script sea
 ```json
 {
   "ffmpeg_path": "C:\\ffmpeg",
-  "log_dir": "V:\\Logs\\ffmpeg_nvenc_h265",
+  "log_path": "V:\\Logs\\ffmpeg_nvenc_h265",
   "processed_path": "V:\\Processed",
-  "processing_temp": "V:\\ProcessingTemp",
+  "processing_path": "V:\\ProcessingTemp",
   "media_path": "V:\\Media",
+  "movies_subfolder": "Movies",
+  "tv_shows_subfolder": "TV Shows",
   "radarr_baseUri": "http://192.168.10.15:7878",
   "radarr_apiKey": "your-radarr-api-key-here",
   "sonarr_baseUri": "http://192.168.10.15:8989",
@@ -59,41 +78,44 @@ Create a `ffmpeg_nvenc_h265.config.json` file with your settings. The script sea
 }
 ```
 
+`movies_subfolder` and `tv_shows_subfolder` are optional. They default to `Movies` and `TV Shows`.
+Use them when your library uses different names, for example `films` and `series`.
+
 **Setup:**
 
-1. Copy `ffmpeg_nvenc_h265.config.example.json` to `ffmpeg_nvenc_h265.config.json` in your Documents folder
-2. Edit the file with your actual API keys and paths
-3. Run the script normally - it will auto-discover the config
+Config file setup is optional. The default/primary configuration source is environment variables.
 
-**For symlinked setup:**
-- Keep ffmpeg_nvenc_h265.config.json in `~\OneDrive\Documents\ffmpeg_nvenc_h265.config.json`
-- Create symlink: `~\OneDrive\Documents\ffmpeg_convert_nvenc_parallel.ps1` → `~\source\repos\ffmpeg_nvenc_h265\ffmpeg_nvenc_h265.ps1`
-- The script will find the config in Documents automatically
+1. (Optional) Copy `ffmpeg_nvenc_h265.config.example.json` to `ffmpeg_nvenc_h265.config.json` in your folder
+2. (Optional) Edit the file with your actual API keys and paths
+3. Set environment variables for primary config values (see mapping below; `log_path` is optional)
+4. Run the script normally; if any value is missing from env vars, the script falls back to config file discovery
 
 ### Environment Variable Fallback (No Defaults)
 
 Environment variables are checked first for every required value.
 You can keep values in config as fallback where env vars are not set.
-If both are missing/empty, the script fails fast.
+If both are missing/empty, the script fails fast (except `log_path`, which has discovery-based fallback).
 
 Mapping:
 
 - `ffmpeg_path` → `FFMPEG_PATH`
-- `log_dir` → `FFMPEG_LOG_DIR`
+- `log_path` (optional) → `FFMPEG_LOG_PATH`
 - `processed_path` → `FFMPEG_PROCESSED_PATH`
-- `processing_temp` → `FFMPEG_PROCESSING_TEMP`
+- `processing_path` → `FFMPEG_PROCESSING_PATH`
 - `media_path` → `FFMPEG_MEDIA_PATH`
+- `movies_subfolder` (optional) → `FFMPEG_MOVIES_SUBFOLDER`
+- `tv_shows_subfolder` (optional) → `FFMPEG_TV_SHOWS_SUBFOLDER`
 - `radarr_baseUri` → `RADARR_BASE_URI`
 - `radarr_apiKey` → `RADARR_API_KEY`
 - `sonarr_baseUri` → `SONARR_BASE_URI`
 - `sonarr_apiKey` → `SONARR_API_KEY`
 
-### ConfigDir Parameter
+### ConfigPath Parameter
 
 Explicitly specify where to load ffmpeg_nvenc_h265.config.json from:
 
 ```powershell
-.\ffmpeg_nvenc_h265.ps1 -Path "C:\Videos" -ConfigDir "C:\MyConfigs"
+.\ffmpeg_nvenc_h265.ps1 -Path "C:\Videos" -ConfigPath "C:\MyConfigs"
 ```
 
 This overrides automatic discovery and only looks in the specified directory.
@@ -102,11 +124,13 @@ This overrides automatic discovery and only looks in the specified directory.
 
 ### Basic Usage
 
-Convert all video files in a directory using default settings:
+Convert all video files in a directory using default settings. The `-Path` parameter accepts the full path to your media directory:
 
 ```powershell
-.\ffmpeg_nvenc_h265.ps1 -Path "C:\Videos\Movies"
+.\ffmpeg_nvenc_h265.ps1 -Path "V:\Media\TV Shows"
 ```
+
+The script automatically detects whether to refresh Radarr (Movies) or Sonarr (TV Shows) based on the path structure.
 
 ### Common Examples
 
@@ -182,6 +206,29 @@ Converts videos but skips moving files to the processed folder and skips Radarr/
 
 Single-threaded conversion with forced 720p resize for quality testing, showing the exact FFmpeg commands.
 
+#### Example 9: Using ConfigPath for Explicit Config Location
+
+```powershell
+.\ffmpeg_nvenc_h265.ps1 -Path "V:\Media\TV Shows" `
+    -ConfigPath "C:\Users\Administrator\OneDrive\Documents"
+```
+
+Explicitly specify config file location (overrides auto-discovery search). The script loads `ffmpeg_nvenc_h265.config.json` from the specified directory.
+
+#### Example 10: ConfigPath with Environment Variables
+
+```powershell
+$env:FFMPEG_PATH = "C:\ffmpeg"
+$env:FFMPEG_LOG_PATH = "V:\Logs"
+$env:FFMPEG_PROCESSED_PATH = "V:\Processed"
+$env:FFMPEG_PROCESSING_PATH = "V:\ProcessingTemp"
+$env:FFMPEG_MEDIA_PATH = "V:\Media"
+
+.\ffmpeg_nvenc_h265.ps1 -Path "V:\Media\Movies" -ConfigPath "D:\Configs" -MaxParallelJobs 4
+```
+
+Use environment variables as primary config (checked first), with ConfigPath as fallback for any config file values. This is ideal for containerized/cloud deployments where env vars are preferred.
+
 ## Parameters
 
 ### Required Parameters
@@ -194,7 +241,6 @@ Single-threaded conversion with forced 720p resize for quality testing, showing 
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `-RootPath` | string | "" | Root path type: "movies" or "tvshows" for Radarr/Sonarr integration |
 | `-MaxParallelJobs` | int | 3 | Maximum number of concurrent encoding jobs (1-8) |
 | `-ShowOutputCmd` | switch | false | Display FFmpeg commands being executed |
 | `-NoProgress` | switch | false | Disable progress bars |
@@ -218,7 +264,7 @@ Single-threaded conversion with forced 720p resize for quality testing, showing 
 | `-SubLang` | string | "eng" | Preferred subtitle language code |
 | `-LastRunDate` | datetime | - | Only process files modified after this date |
 | `-SkipFileLock` | switch | false | Skip file lock check (process files even if in use) |
-| `-ConfigDir` | string | "" | Directory containing ffmpeg_nvenc_h265.config.json (overrides auto-discovery) |
+| `-ConfigPath` | string | "" | Directory containing ffmpeg_nvenc_h265.config.json (overrides auto-discovery) |
 
 ## Quality Settings Guide
 
@@ -253,7 +299,8 @@ See the **Configuration** section above for how to customize these paths.
 
 When `-LogEnabled` is specified, logs are created in the configured log directory:
 
-Logs are written to `log_dir` from config (or `FFMPEG_LOG_DIR` from environment variables).
+Logs are written to `log_path` from config (or `FFMPEG_LOG_PATH` from environment variables).
+If `log_path` is not provided, the script uses config discovery locations (loaded config directory, then current directory, Documents, script directory).
 
 - **Main Log Format**: `ffmpeg_nvenc_h265_YYYYMMDDHHMMSSFFFF.log`
 - **Per-Job Progress Log Format**: `ffmpeg_nvenc_h265_progress_job{JobId}_YYYYMMDDHHMMSS.log` (when `-LogVerbose` is enabled)
@@ -267,6 +314,13 @@ The script integrates with Radarr and Sonarr for automatic library updates. Conf
 **Example configuration:**
 - **Radarr**: `http://192.168.10.15:7878`
 - **Sonarr**: `http://192.168.10.15:8989`
+
+**Automatic Media Type Detection:**
+The script automatically determines whether to refresh Radarr (Movies) or Sonarr (TV Shows) based on where each file is located:
+- Files under `media_path\<movies_subfolder>` trigger Radarr refresh
+- Files under `media_path\<tv_shows_subfolder>` trigger Sonarr refresh
+
+This allows processing of mixed content. For example, `-Path "V:\Media"` will process both Movies and TV Shows subdirectories, with each file refreshed in the appropriate system based on its actual location.
 
 After processing, the script triggers a refresh scan to update the media server database using the configured base URLs and API keys.
 
@@ -308,7 +362,7 @@ All configurable settings are set via `ffmpeg_nvenc_h265.config.json`. See the *
 {
   "ffmpeg_path": "C:\\ffmpeg",
   "processed_path": "V:\\Processed",
-  "processing_temp": "V:\\ProcessingTemp",
+  "processing_path": "V:\\ProcessingTemp",
   "media_path": "V:\\Media",
   "radarr_baseUri": "http://192.168.10.15:7878",
   "radarr_apiKey": "your-radarr-api-key",
