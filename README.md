@@ -269,11 +269,23 @@ Use environment variables as primary config (checked first), with ConfigPath as 
 | `-ExitOnError` | switch | false | Stop all processing if any job fails |
 | `-SortExpression` | hashtable | Name, Ascending | Sort order for processing files |
 | `-UserFilter` | scriptblock | All files | Custom filter for selecting files |
-| `-AudioLang` | string | "eng" | Preferred audio language code |
-| `-SubLang` | string | "eng" | Preferred subtitle language code |
+| `-AudioLang` | string | "eng" | ISO 639-2 audio language code to keep; see language behavior below |
+| `-SubLang` | string | "eng" | ISO 639-2 subtitle language code to keep; see language behavior below |
 | `-LastRunDate` | datetime | - | Only process files modified after this date |
 | `-SkipFileLock` | switch | false | Skip file lock check (process files even if in use) |
 | `-ConfigPath` | string | "" | Directory containing ffmpeg_nvenc_h265.config.json (overrides auto-discovery) |
+
+### Audio and Subtitle Language Behavior
+
+Both `-AudioLang` and `-SubLang` accept an [ISO 639-2](https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes) three-letter language code (e.g. `eng`, `jpn`, `fra`) or one of the special values below.
+
+| Value | Outcome |
+|---|---|
+| `eng` (or any language code) | Only streams tagged with that language are kept. If no matching streams exist in the file, **all** streams of that type are kept as a fallback. |
+| `all` | All streams of that type are kept regardless of language tag. |
+| `nomap` or `none` | No streams of that type are mapped — the track is completely excluded from the output. |
+
+If the source file contains no audio or subtitle streams at all, the map is made optional so ffmpeg does not error out.
 
 ## Quality Settings Guide
 
