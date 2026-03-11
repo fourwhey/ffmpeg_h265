@@ -35,7 +35,8 @@ param(
   [Parameter(Mandatory = $false)][string] $SubLang = "eng",
   [Parameter(Mandatory = $false)][datetime] $LastRunDate,
   [Parameter(Mandatory = $false)][switch] $SkipFileLock = $false,
-  [Parameter(Mandatory = $false, HelpMessage = "Directory containing ffmpeg_nvenc_h265.config.json")][string] $ConfigPath = ""
+  [Parameter(Mandatory = $false, HelpMessage = "Directory containing the .config.json file")][string] $ConfigPath = "",
+  [Parameter(Mandatory = $false, HelpMessage = "Hardware encoder profile: auto, nvenc, amf, qsv, software")][ValidateSet('auto', 'nvenc', 'amf', 'qsv', 'software')][string] $Encoder = 'auto'
 )
 
 $ShowProgress = -not $NoProgress.IsPresent
@@ -60,6 +61,7 @@ $script:PendingQueueRef = $null
 $script:CandidateQueueRef = $null
 $script:TotalWorkCount = 0
 $script:FFprobeTimeoutSeconds = 90
+$script:HWProfile = $null
 
 if ($PSVersionTable.PSVersion -lt [version]'7.5.0') {
   throw "This script requires PowerShell 7.5 or newer. Current version: $($PSVersionTable.PSVersion)"
@@ -92,6 +94,7 @@ $script:RunConfig = [ordered]@{
   LastRunDate          = $LastRunDate
   SkipFileLock         = $SkipFileLock.IsPresent
   ConfigPath           = $ConfigPath
+  Encoder              = $Encoder
 }
 
 if (-not [int]::TryParse($CQPRateControl, [ref]$script:CQPRateControlInt)) {
@@ -119,19 +122,46 @@ if ($MaxParallelJobs -lt 1) { $MaxParallelJobs = 1 }
 if ($MaxParallelJobs -gt 4) { $MaxParallelJobs = 4 }
 
 if ($MaxParallelJobs -gt 3) {
-  Write-Host "Warning: MaxParallelJobs=$MaxParallelJobs may exceed practical NVENC concurrency on many GPUs." -ForegroundColor Yellow
+  Write-Host "Warning: MaxParallelJobs=$MaxParallelJobs may exceed practical hardware encoder concurrency on many systems." -ForegroundColor Yellow
 }
 
 $script:ScriptRoot = $PSScriptRoot
 if (-not $script:ScriptRoot) {
   $script:ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 }
+# When invoked via a symlink, $PSScriptRoot resolves to the target directory.
+# Capture the symlink's own directory so config discovery finds files placed beside it.
+$script:InvokedScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Source
+# Derive config filename from the invoked script name (e.g. foo.ps1 -> foo.config.json).
+$invokedScriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Source)
+if ([string]::IsNullOrWhiteSpace($invokedScriptName)) {
+  $invokedScriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Path)
+}
+$script:ConfigFileName = "$invokedScriptName.config.json"
+$script:ConfigFileNames = [System.Collections.Generic.List[string]]::new()
+[void]$script:ConfigFileNames.Add($script:ConfigFileName)
+$targetScriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Path)
+if (-not [string]::IsNullOrWhiteSpace($targetScriptName)) {
+  $targetConfigName = "$targetScriptName.config.json"
+  if (-not $script:ConfigFileNames.Contains($targetConfigName)) {
+    [void]$script:ConfigFileNames.Add($targetConfigName)
+  }
+}
+# When launched from a wrapper script (e.g. ConvertMovieLibrary_264.ps1), capture its directory.
+$script:CallerScriptDir = $null
+$callerFrame = Get-PSCallStack | Select-Object -Skip 1 -First 1
+if ($callerFrame -and -not [string]::IsNullOrWhiteSpace($callerFrame.ScriptName)) {
+  $script:CallerScriptDir = Split-Path -Parent $callerFrame.ScriptName
+}
 
-$script:logFileName = "ffmpeg_nvenc_h265_$(Get-Date -Format "yyyyMMddHHmmssffff").log"
+$script:LogPrefix = $invokedScriptName
+$script:logFileName = "${script:LogPrefix}_$(Get-Date -Format "yyyyMMddHHmmssffff").log"
 $script:logFilePath = $null
-$script:LogMutexName = if ($IsWindows) { "Global\ffmpeg_nvenc_h265_log" }
-else { "ffmpeg_nvenc_h265_log" }
+$script:LogMutexName = if ($IsWindows) { "Global\${script:LogPrefix}_log" }
+else { "${script:LogPrefix}_log" }
 $script:LogMutex = $null
+$script:ArrRefreshJobs = [System.Collections.Generic.List[object]]::new()
+$script:ArrRefreshJobMeta = @{}
 
 # Configuration values are required, resolved as env var first, then config file.
 # Precedence for environment/deployment settings is:
@@ -142,7 +172,7 @@ function Get-ConfigValue {
   param(
     [Parameter(Mandatory = $true)][string]$ConfigKey,
     [Parameter(Mandatory = $true)][string]$EnvVarName,
-    [Parameter(Mandatory = $true)][object]$ConfigData
+    [Parameter(Mandatory = $false)][object]$ConfigData = $null
   )
 
   $value = [Environment]::GetEnvironmentVariable($EnvVarName)
@@ -152,7 +182,8 @@ function Get-ConfigValue {
   }
 
   if ([string]::IsNullOrWhiteSpace([string]$value)) {
-    throw "Required setting '$ConfigKey' is missing. Set '$ConfigKey' in ffmpeg_nvenc_h265.config.json or environment variable '$EnvVarName'."
+    $configHints = ($script:ConfigFileNames | ForEach-Object { "'$_'" }) -join ', '
+    throw "Required setting '$ConfigKey' is missing. Set '$ConfigKey' in one of: $configHints, or environment variable '$EnvVarName'."
   }
 
   return $value
@@ -162,7 +193,7 @@ function Get-OptionalConfigValue {
   param(
     [Parameter(Mandatory = $true)][string]$ConfigKey,
     [Parameter(Mandatory = $true)][string]$EnvVarName,
-    [Parameter(Mandatory = $true)][object]$ConfigData
+    [Parameter(Mandatory = $false)][object]$ConfigData = $null
   )
 
   $value = [Environment]::GetEnvironmentVariable($EnvVarName)
@@ -174,70 +205,189 @@ function Get-OptionalConfigValue {
   return $value
 }
 
-function Resolve-DiscoveredLogPath {
+function Resolve-LogPath {
   param(
+    [Parameter(Mandatory = $false)][string]$ExplicitPath,
+    [Parameter(Mandatory = $true)][string]$DefaultPrefix,
+    [Parameter(Mandatory = $true)][string]$DefaultFileName,
     [Parameter(Mandatory = $true)][string[]]$SearchLocations,
     [Parameter(Mandatory = $false)][string]$LoadedConfigDirectory
   )
 
-  if (-not [string]::IsNullOrWhiteSpace($LoadedConfigDirectory)) { return $LoadedConfigDirectory }
-
-  foreach ($location in $SearchLocations) {
-    if ([string]::IsNullOrWhiteSpace($location)) { continue }
-    if (Test-Path -LiteralPath $location -PathType Container -ErrorAction SilentlyContinue) {
-      return $location
+  if (-not [string]::IsNullOrWhiteSpace($ExplicitPath)) {
+    if ([System.IO.Path]::HasExtension($ExplicitPath) -and
+        -not (Test-Path -LiteralPath $ExplicitPath -PathType Container -ErrorAction SilentlyContinue)) {
+      # Full file path (e.g. C:\logs\my_log.log) — use as the log file directly.
+      $prefix = [System.IO.Path]::GetFileNameWithoutExtension($ExplicitPath)
+      return @{
+        Directory = Split-Path -Parent $ExplicitPath
+        FileName  = Split-Path -Leaf $ExplicitPath
+        FilePath  = $ExplicitPath
+        Prefix    = $prefix
+      }
+    }
+    # Existing or new directory — use invocation-derived log name within it.
+    return @{
+      Directory = $ExplicitPath
+      FileName  = $DefaultFileName
+      FilePath  = Join-Path $ExplicitPath $DefaultFileName
+      Prefix    = $DefaultPrefix
     }
   }
 
-  return $PWD.Path
-}
-
-$configData = $null
-$configLocations = @()
-$loadedConfigDirectory = $null
-
-# Check for FFENC_CONFIGPATH environment variable if ConfigPath not explicitly provided
-if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
-  $envConfigPath = [Environment]::GetEnvironmentVariable('FFENC_CONFIGPATH')
-  if (-not [string]::IsNullOrWhiteSpace($envConfigPath)) {
-    $ConfigPath = $envConfigPath
+  # Auto-discover: config dir, search locations, or $PWD.
+  $dir = $PWD.Path
+  if (-not [string]::IsNullOrWhiteSpace($LoadedConfigDirectory)) {
+    $dir = $LoadedConfigDirectory
+  } else {
+    foreach ($location in $SearchLocations) {
+      if ([string]::IsNullOrWhiteSpace($location)) { continue }
+      if (Test-Path -LiteralPath $location -PathType Container -ErrorAction SilentlyContinue) {
+        $dir = $location
+        break
+      }
+    }
+  }
+  return @{
+    Directory = $dir
+    FileName  = $DefaultFileName
+    FilePath  = Join-Path $dir $DefaultFileName
+    Prefix    = $DefaultPrefix
   }
 }
 
-if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
-  # Explicit ConfigPath overrides all discovery
-  $configLocations = @($ConfigPath)
-}
-else {
-  # Auto-discovery: current dir, script root
-  $configLocations = @(
-    $PWD.Path,
-    $script:ScriptRoot
+function Resolve-Config {
+  param(
+    [Parameter(Mandatory = $false)][string]$ExplicitConfigPath,
+    [Parameter(Mandatory = $true)][string[]]$CandidateConfigFileNames,
+    [Parameter(Mandatory = $true)][string[]]$AutoDiscoveryLocations
   )
-}
 
-foreach ($location in $configLocations) {
-  if ([string]::IsNullOrWhiteSpace($location)) { continue }
-  
-  $configPath = Join-Path $location "ffmpeg_nvenc_h265.config.json"
-  if (Test-Path -LiteralPath $configPath) {
-    try {
-      $configData = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
-      $loadedConfigDirectory = Split-Path -Parent $configPath
-      Write-Verbose "Loaded configuration from: $configPath"
-      break
-    }
-    catch {
-      Write-Warning "Failed to load config from '$configPath': $($_.Exception.Message)"
+  $resolvedConfigData = $null
+  $resolvedConfigLocations = @()
+  $resolvedLoadedConfigDirectory = $null
+  $resolvedConfigFileName = $CandidateConfigFileNames[0]
+  $resolvedConfigFileNames = [System.Collections.Generic.List[string]]::new()
+  foreach ($candidateConfigFileName in $CandidateConfigFileNames) {
+    if (-not [string]::IsNullOrWhiteSpace($candidateConfigFileName) -and -not $resolvedConfigFileNames.Contains($candidateConfigFileName)) {
+      [void]$resolvedConfigFileNames.Add($candidateConfigFileName)
     }
   }
+
+  if ([string]::IsNullOrWhiteSpace($ExplicitConfigPath)) {
+    $envConfigPath = [Environment]::GetEnvironmentVariable('FFENC_CONFIGPATH')
+    if (-not [string]::IsNullOrWhiteSpace($envConfigPath)) {
+      $ExplicitConfigPath = $envConfigPath
+    }
+  }
+
+  if (-not [string]::IsNullOrWhiteSpace($ExplicitConfigPath)) {
+    if ($ExplicitConfigPath -match '\.json$' -and (Test-Path -LiteralPath $ExplicitConfigPath -PathType Leaf)) {
+      try {
+        $resolvedConfigData = Get-Content -LiteralPath $ExplicitConfigPath -Raw | ConvertFrom-Json
+        $resolvedLoadedConfigDirectory = Split-Path -Parent $ExplicitConfigPath
+        $resolvedConfigFileName = Split-Path -Leaf $ExplicitConfigPath
+        $resolvedConfigFileNames.Clear()
+        [void]$resolvedConfigFileNames.Add($resolvedConfigFileName)
+      }
+      catch {
+        Write-Warning "Failed to load config from '$ExplicitConfigPath': $($_.Exception.Message)"
+      }
+      $resolvedConfigLocations = @($resolvedLoadedConfigDirectory)
+    }
+    else {
+      $resolvedConfigLocations = @($ExplicitConfigPath)
+    }
+  }
+  else {
+    $seenConfigLocations = [System.Collections.Generic.HashSet[string]]::new(
+      $(if ($IsWindows) { [System.StringComparer]::OrdinalIgnoreCase } else { [System.StringComparer]::Ordinal })
+    )
+    foreach ($candidateLocation in $AutoDiscoveryLocations) {
+      if ([string]::IsNullOrWhiteSpace($candidateLocation)) { continue }
+      if ($seenConfigLocations.Add($candidateLocation)) {
+        $resolvedConfigLocations += $candidateLocation
+      }
+    }
+  }
+
+  if (-not $resolvedConfigData) {
+    foreach ($location in $resolvedConfigLocations) {
+      if ([string]::IsNullOrWhiteSpace($location)) { continue }
+
+      foreach ($candidateConfigName in $resolvedConfigFileNames) {
+        $configPath = Join-Path $location $candidateConfigName
+        if (Test-Path -LiteralPath $configPath) {
+          try {
+            $resolvedConfigData = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+            $resolvedLoadedConfigDirectory = Split-Path -Parent $configPath
+            $resolvedConfigFileName = $candidateConfigName
+            break
+          }
+          catch {
+            Write-Warning "Failed to load config from '$configPath': $($_.Exception.Message)"
+          }
+        }
+      }
+
+      if ($resolvedConfigData) { break }
+    }
+  }
+
+  $searchedPaths = @(
+    foreach ($location in ($resolvedConfigLocations | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+      foreach ($candidateConfigName in $resolvedConfigFileNames) {
+        Join-Path $location $candidateConfigName
+      }
+    }
+  )
+
+  return [PSCustomObject]@{
+    ConfigData             = $resolvedConfigData
+    ConfigLocations        = $resolvedConfigLocations
+    LoadedConfigDirectory  = $resolvedLoadedConfigDirectory
+    ConfigFileName         = $resolvedConfigFileName
+    ConfigFileNames        = @($resolvedConfigFileNames)
+    SearchedPaths          = $searchedPaths
+  }
+}
+
+$resolvedConfig = Resolve-Config -ExplicitConfigPath $ConfigPath -CandidateConfigFileNames @($script:ConfigFileNames) -AutoDiscoveryLocations @(
+  $PWD.Path,
+  $script:CallerScriptDir,
+  $script:InvokedScriptDir,
+  $script:ScriptRoot
+)
+
+$configData = $resolvedConfig.ConfigData
+$configLocations = @($resolvedConfig.ConfigLocations)
+$loadedConfigDirectory = $resolvedConfig.LoadedConfigDirectory
+$script:ConfigFileName = $resolvedConfig.ConfigFileName
+$script:ConfigFileNames.Clear()
+foreach ($resolvedConfigFileName in @($resolvedConfig.ConfigFileNames)) {
+  [void]$script:ConfigFileNames.Add($resolvedConfigFileName)
+}
+
+if (-not $configData) {
+  Write-Host "Configuration file not found. Searched:" -ForegroundColor Yellow
+  foreach ($searchedPath in @($resolvedConfig.SearchedPaths)) {
+    Write-Host "  $searchedPath" -ForegroundColor Yellow
+  }
+  Write-Host "Provide -ConfigPath, set FFENC_CONFIGPATH, or place a config file beside the invoked script." -ForegroundColor Yellow
+  exit 1
 }
 
 $script:ffmpeg_path = Get-ConfigValue -ConfigKey "ffmpeg_path" -EnvVarName "FFENC_FFMPEG_PATH" -ConfigData $configData
-$script:log_path = Get-OptionalConfigValue -ConfigKey "log_path" -EnvVarName "FFENC_LOG_PATH" -ConfigData $configData
-if ([string]::IsNullOrWhiteSpace([string]$script:log_path)) {
-  $script:log_path = Resolve-DiscoveredLogPath -SearchLocations $configLocations -LoadedConfigDirectory $loadedConfigDirectory
-}
+$explicitLogPath = Get-OptionalConfigValue -ConfigKey "log_path" -EnvVarName "FFENC_LOG_PATH" -ConfigData $configData
+$defaultLogPrefix = $script:LogPrefix
+$defaultLogFileName = $script:logFileName
+$logResolved = Resolve-LogPath -ExplicitPath $explicitLogPath -DefaultPrefix $defaultLogPrefix -DefaultFileName $defaultLogFileName `
+  -SearchLocations $configLocations -LoadedConfigDirectory $loadedConfigDirectory
+$script:log_path = $logResolved.Directory
+$script:logFileName = $logResolved.FileName
+$script:logFilePath = $logResolved.FilePath
+$script:LogPrefix = $logResolved.Prefix
+$script:LogMutexName = if ($IsWindows) { "Global\${script:LogPrefix}_log" } else { "${script:LogPrefix}_log" }
 $processed_path = Get-ConfigValue -ConfigKey "processed_path" -EnvVarName "FFENC_PROCESSED_PATH" -ConfigData $configData
 $processing_path = Get-ConfigValue -ConfigKey "processing_path" -EnvVarName "FFENC_PROCESSING_PATH" -ConfigData $configData
 $media_path = Get-ConfigValue -ConfigKey "media_path" -EnvVarName "FFENC_MEDIA_PATH" -ConfigData $configData
@@ -278,10 +428,31 @@ if (-not (Test-Path -LiteralPath $script:ffprobe_exe)) {
 }
 
 if (-not (Test-Path -LiteralPath $script:log_path)) {
-  New-Item -Path $script:log_path -ItemType Directory -Force | Out-Null
-}
+  try {
+    New-Item -Path $script:log_path -ItemType Directory -Force -ErrorAction Stop | Out-Null
+  }
+  catch {
+    $requestedLogPath = $script:log_path
+    $fallbackLogPath = $script:InvokedScriptDir
+    if ([string]::IsNullOrWhiteSpace($fallbackLogPath) -or
+        -not (Test-Path -LiteralPath $fallbackLogPath -PathType Container -ErrorAction SilentlyContinue)) {
+      $fallbackLogPath = $script:ScriptRoot
+    }
+    if ([string]::IsNullOrWhiteSpace($fallbackLogPath) -or
+        -not (Test-Path -LiteralPath $fallbackLogPath -PathType Container -ErrorAction SilentlyContinue)) {
+      $fallbackLogPath = $PWD.Path
+    }
 
-$script:logFilePath = Join-Path $script:log_path $script:logFileName
+    $script:log_path = $fallbackLogPath
+    $script:LogPrefix = $defaultLogPrefix
+    $script:logFileName = $defaultLogFileName
+    $script:logFilePath = Join-Path $script:log_path $script:logFileName
+    $script:LogMutexName = if ($IsWindows) { "Global\${script:LogPrefix}_log" } else { "${script:LogPrefix}_log" }
+
+    Write-Host "Log path fallback active: requested '$requestedLogPath' was unavailable; using '$($script:log_path)'." -ForegroundColor Yellow
+    Write-Warning "Failed to create log directory '$requestedLogPath' ($($_.Exception.Message)). Falling back to '$($script:log_path)'."
+  }
+}
 
 enum LogLevel {
   Information = 0
@@ -375,6 +546,34 @@ function Write-VerboseParallelLog {
   if (-not $LogVerbose) { return }
 
   Write-ParallelLog -Message "[VERBOSE] $Message" -Target Log -JobId $JobId
+}
+
+if ($loadedConfigDirectory) {
+  $configFile = Join-Path $loadedConfigDirectory $script:ConfigFileName
+  Write-ParallelLog -Message "Loaded configuration from: '$configFile'" -Target Both
+
+  if ($configData) {
+    $configSummary = ($configData.PSObject.Properties | ForEach-Object {
+      $k = $_.Name
+      $v = [string]$_.Value
+      if ($k -imatch 'key|secret|token|password') {
+        if ([string]::IsNullOrWhiteSpace($v)) { $v = '(not set)' }
+        elseif (-not $LogVerbose) { $v = ($v.Substring(0, [Math]::Min(4, $v.Length))) + '****' }
+      }
+      "$k=$v"
+    }) -join '; '
+    Write-ParallelLog -Message "Configuration settings: $configSummary" -Target Log
+  }
+}
+else {
+  $searchedPaths = @(
+    foreach ($location in ($configLocations | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+      foreach ($candidateConfigName in $script:ConfigFileNames) {
+        Join-Path $location $candidateConfigName
+      }
+    }
+  ) -join ', '
+  Write-ParallelLog -Message "No configuration file found. Searched: $searchedPaths" -Level Warning -Target Both
 }
 
 function Read-FFmpegProgressLine {
@@ -560,9 +759,16 @@ function Get-ScaleArgument {
     return "" 
   }
 
-  if ($RetainAspectValue) { return "-vf scale_cuda=${w}:-1:interp_algo=lanczos" }
+  $scaleFilter = 'scale_cuda'
+  $scaleSuffix = ':interp_algo=lanczos'
+  if ($script:HWProfile) {
+    $scaleFilter = $script:HWProfile.ScaleFilter
+    $scaleSuffix = $script:HWProfile.ScaleSuffix
+  }
 
-  return "-vf scale_cuda=${w}:${h}:interp_algo=lanczos"
+  if ($RetainAspectValue) { return "-vf ${scaleFilter}=${w}:-1${scaleSuffix}" }
+
+  return "-vf ${scaleFilter}=${w}:${h}${scaleSuffix}"
 }
 
 function Get-TargetResolution {
@@ -617,9 +823,16 @@ function Get-ScaleArgumentFromProbe {
     if (($srcPixels -le $dstPixels) -and (-not $CanScaleUpValue) -and (-not $ForceConvertValue)) { return "" }
   }
 
-  if ($RetainAspectValue) { return "-vf scale_cuda=$($targetRes.Width):-1:interp_algo=lanczos" }
+  $scaleFilter = 'scale_cuda'
+  $scaleSuffix = ':interp_algo=lanczos'
+  if ($script:HWProfile) {
+    $scaleFilter = $script:HWProfile.ScaleFilter
+    $scaleSuffix = $script:HWProfile.ScaleSuffix
+  }
 
-  return "-vf scale_cuda=$($targetRes.Width):$($targetRes.Height):interp_algo=lanczos"
+  if ($RetainAspectValue) { return "-vf ${scaleFilter}=$($targetRes.Width):-1${scaleSuffix}" }
+
+  return "-vf ${scaleFilter}=$($targetRes.Width):$($targetRes.Height)${scaleSuffix}"
 }
 
 function Get-AudioMapArg {
@@ -676,6 +889,221 @@ function Get-EncodeAnalysis {
   }
 }
 
+function Get-HardwareEncoderProfile {
+  [OutputType([PSCustomObject])]
+  param(
+    [Parameter(Mandatory = $false)][ValidateSet('auto', 'nvenc', 'amf', 'qsv', 'software')][string]$PreferredEncoder = 'auto'
+  )
+
+  function New-HwAccelOption {
+    param(
+      [Parameter(Mandatory = $true)][string]$Name,
+      [Parameter(Mandatory = $false)][string]$Args = '',
+      [Parameter(Mandatory = $true)][string]$ScaleFilter,
+      [Parameter(Mandatory = $false)][string]$ScaleSuffix = ''
+    )
+
+    return [PSCustomObject]@{
+      Name        = $Name
+      Args        = $Args
+      ScaleFilter = $ScaleFilter
+      ScaleSuffix = $ScaleSuffix
+    }
+  }
+
+  function Get-AvailableHwAccelSet {
+    param([string]$HwaccelsText)
+
+    $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if ([string]::IsNullOrWhiteSpace($HwaccelsText)) { return $set }
+
+    foreach ($line in ($HwaccelsText -split "`r?`n")) {
+      $name = $line.Trim()
+      if ([string]::IsNullOrWhiteSpace($name)) { continue }
+      if ($name -match '^(Hardware acceleration methods:|ffmpeg version|configuration:|libav)') { continue }
+      if ($name -notmatch '^[a-z0-9_]+$') { continue }
+      [void]$set.Add($name)
+    }
+
+    return $set
+  }
+
+  function Select-HwAccelOption {
+    param(
+      [Parameter(Mandatory = $true)][object[]]$Options,
+      [Parameter(Mandatory = $true)][System.Collections.Generic.HashSet[string]]$AvailableHwaccels
+    )
+
+    foreach ($option in $Options) {
+      if ($option.Name -in @('none', 'auto')) { return $option }
+      if ($AvailableHwaccels.Contains($option.Name)) { return $option }
+    }
+
+    return (New-HwAccelOption -Name 'none' -Args '' -ScaleFilter 'scale' -ScaleSuffix ':flags=lanczos')
+  }
+
+  function Build-Profile {
+    param(
+      [Parameter(Mandatory = $true)][string]$ProfileName,
+      [Parameter(Mandatory = $true)][string]$Encoder,
+      [Parameter(Mandatory = $true)][scriptblock]$CodecArgs,
+      [Parameter(Mandatory = $true)][object[]]$HwAccelOptions,
+      [Parameter(Mandatory = $true)][System.Collections.Generic.HashSet[string]]$AvailableHwaccels
+    )
+
+    $selectedAccel = Select-HwAccelOption -Options $HwAccelOptions -AvailableHwaccels $AvailableHwaccels
+    $selectedIndex = [Array]::IndexOf($HwAccelOptions, $selectedAccel)
+
+    $fallbackChain = @()
+    for ($i = $selectedIndex; $i -lt ($HwAccelOptions.Count - 1); $i++) {
+      $fromOpt = $HwAccelOptions[$i]
+      $toOpt   = $HwAccelOptions[$i + 1]
+      $fallbackChain += {
+        param([string]$Args)
+        $next = $Args
+        if ($fromOpt.Args -ne $toOpt.Args) {
+          $next = $next.Replace($fromOpt.Args, $toOpt.Args)
+        }
+        if ($fromOpt.ScaleFilter -ne $toOpt.ScaleFilter) {
+          $next = $next.Replace("$($fromOpt.ScaleFilter)=", "$($toOpt.ScaleFilter)=")
+        }
+        if ($fromOpt.ScaleSuffix -ne $toOpt.ScaleSuffix) {
+          $next = $next.Replace($fromOpt.ScaleSuffix, $toOpt.ScaleSuffix)
+        }
+        return $next
+      }.GetNewClosure()
+    }
+
+    return [PSCustomObject]@{
+      Name          = $ProfileName
+      Encoder       = $Encoder
+      HwaccelName   = $selectedAccel.Name
+      HwaccelArgs   = $selectedAccel.Args
+      ScaleFilter   = $selectedAccel.ScaleFilter
+      ScaleSuffix   = $selectedAccel.ScaleSuffix
+      CodecArgs     = $CodecArgs
+      FallbackChain = $fallbackChain
+    }
+  }
+
+  $encodersText = ''
+  $hwaccelsText = ''
+  try {
+    $encodersText = (& $script:ffmpeg_exe -hide_banner -encoders 2>&1 | Out-String)
+    $hwaccelsText = (& $script:ffmpeg_exe -hide_banner -hwaccels 2>&1 | Out-String)
+  }
+  catch {
+    Write-ParallelLog -Message "Unable to query ffmpeg capabilities: $($_.Exception.Message). Falling back to software." -Level Warning -Target Both
+    return [PSCustomObject]@{
+      Name          = 'software'
+      Encoder       = 'libx265'
+      HwaccelName   = 'none'
+      HwaccelArgs   = ''
+      ScaleFilter   = 'scale'
+      ScaleSuffix   = ':flags=lanczos'
+      CodecArgs     = {
+        param([int]$Cqp, [string]$BitrateArg)
+        return "-crf $Cqp -preset slow "
+      }
+      FallbackChain = @()
+    }
+  }
+
+  $availableHwaccels = Get-AvailableHwAccelSet -HwaccelsText $hwaccelsText
+  $hasNvenc = $encodersText -match '(?im)\bhevc_nvenc\b'
+  $hasAmf = $encodersText -match '(?im)\bhevc_amf\b'
+  $hasQsv = $encodersText -match '(?im)\bhevc_qsv\b'
+
+  $nvencProfile = [PSCustomObject]@{
+    Name = 'unused'
+  }
+
+  $amfProfile = [PSCustomObject]@{
+    Name = 'unused'
+  }
+
+  $qsvProfile = [PSCustomObject]@{
+    Name = 'unused'
+  }
+
+  $softwareProfile = [PSCustomObject]@{
+    Name          = 'software'
+    Encoder       = 'libx265'
+    HwaccelName   = 'none'
+    HwaccelArgs   = ''
+    ScaleFilter   = 'scale'
+    ScaleSuffix   = ':flags=lanczos'
+    CodecArgs     = {
+      param([int]$Cqp, [string]$BitrateArg)
+      return "-crf $Cqp -preset slow "
+    }
+    FallbackChain = @()
+  }
+
+  $nvencOptions = @(
+    (New-HwAccelOption -Name 'cuda' -Args '-hwaccel cuda -hwaccel_output_format cuda' -ScaleFilter 'scale_cuda' -ScaleSuffix ':interp_algo=lanczos')
+    (New-HwAccelOption -Name 'cuda' -Args '-hwaccel cuda'                             -ScaleFilter 'scale_cuda' -ScaleSuffix ':interp_algo=lanczos')
+    (New-HwAccelOption -Name 'auto' -Args '-hwaccel auto'                             -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'none' -Args ''                                          -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
+  )
+
+  $amfOptions = @(
+    (New-HwAccelOption -Name 'd3d11va' -Args '-hwaccel d3d11va -hwaccel_output_format d3d11' -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'dxva2'   -Args '-hwaccel dxva2'                               -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'vaapi'   -Args '-hwaccel vaapi -hwaccel_output_format vaapi'  -ScaleFilter 'scale_vaapi' -ScaleSuffix ':format=nv12')
+    (New-HwAccelOption -Name 'vulkan'  -Args '-hwaccel vulkan -hwaccel_output_format vulkan' -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'auto'    -Args '-hwaccel auto'                                -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'none'    -Args ''                                             -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
+  )
+
+  $qsvOptions = @(
+    (New-HwAccelOption -Name 'qsv'   -Args '-hwaccel qsv -hwaccel_output_format qsv'   -ScaleFilter 'scale_qsv'   -ScaleSuffix '')
+    (New-HwAccelOption -Name 'qsv'   -Args '-hwaccel qsv'                               -ScaleFilter 'scale'       -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'vaapi' -Args '-hwaccel vaapi -hwaccel_output_format vaapi' -ScaleFilter 'scale_vaapi' -ScaleSuffix ':format=nv12')
+    (New-HwAccelOption -Name 'auto'  -Args '-hwaccel auto'                              -ScaleFilter 'scale'       -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'none'  -Args ''                                           -ScaleFilter 'scale'       -ScaleSuffix ':flags=lanczos')
+  )
+
+  $nvencProfile = Build-Profile -ProfileName 'nvenc' -Encoder 'hevc_nvenc' -CodecArgs {
+    param([int]$Cqp, [string]$BitrateArg)
+    return "$BitrateArg-bufsize:v 5MB -preset:v p4 -tune:v hq -tier:v main -rc:v constqp " +
+    "-init_qpI:v $Cqp -init_qpP:v $($Cqp + 1) -init_qpB:v $($Cqp + 2) " +
+    "-rc-lookahead:v 32 -spatial-aq:v 1 -aq-strength:v 8 -temporal-aq:v 1 -b_ref_mode:v 1 "
+  } -HwAccelOptions $nvencOptions -AvailableHwaccels $availableHwaccels
+
+  $amfProfile = Build-Profile -ProfileName 'amf' -Encoder 'hevc_amf' -CodecArgs {
+    param([int]$Cqp, [string]$BitrateArg)
+    return "$BitrateArg-quality balanced -rc cqp -qp_i $Cqp -qp_p $($Cqp + 1) -qp_b $($Cqp + 2) "
+  } -HwAccelOptions $amfOptions -AvailableHwaccels $availableHwaccels
+
+  $qsvProfile = Build-Profile -ProfileName 'qsv' -Encoder 'hevc_qsv' -CodecArgs {
+    param([int]$Cqp, [string]$BitrateArg)
+    return "$BitrateArg-look_ahead 1 -global_quality $Cqp "
+  } -HwAccelOptions $qsvOptions -AvailableHwaccels $availableHwaccels
+
+  $profilesByName = @{
+    nvenc    = $nvencProfile
+    amf      = $amfProfile
+    qsv      = $qsvProfile
+    software = $softwareProfile
+  }
+
+  if ($PreferredEncoder -ne 'auto') {
+    $selectedProfile = $profilesByName[$PreferredEncoder]
+    Write-ParallelLog -Message "Encoder profile forced to '$($selectedProfile.Name)' by parameter -Encoder (hwaccel='$($selectedProfile.HwaccelName)')." -Target Both
+    return $selectedProfile
+  }
+
+  $selectedProfile = $softwareProfile
+  if ($hasNvenc) { $selectedProfile = $nvencProfile }
+  elseif ($hasAmf) { $selectedProfile = $amfProfile }
+  elseif ($hasQsv) { $selectedProfile = $qsvProfile }
+
+  Write-ParallelLog -Message "Encoder auto-detection: Compiled encoders available (hevc_nvenc=$hasNvenc, hevc_amf=$hasAmf, hevc_qsv=$hasQsv)." -Target Both
+  Write-ParallelLog -Message "Encoder auto-detection selected: '$($selectedProfile.Name)' (hwaccel='$($selectedProfile.HwaccelName)')." -Target Both
+  return $selectedProfile
+}
+
 function Invoke-EncodeTestWithFallback {
   param(
     [Parameter(Mandatory = $true)][string]$FFmpegArgs,
@@ -683,13 +1111,17 @@ function Invoke-EncodeTestWithFallback {
     [Parameter(Mandatory = $true)][int]$JobId
   )
 
+  $profile = $script:HWProfile
+  if (-not $profile) { throw "Hardware profile is not initialized." }
+
   $nullSinkArgs = "-ss 0 -to 10 -f null $($script:NullDevice)"
   $testArgs = $FFmpegArgs.Replace('"' + $OutputFile + '"', $nullSinkArgs)
-  $maxRetries = 3
-  $retry = 1
+  $fallbackSteps = @($profile.FallbackChain)
+  $maxAttempts = [Math]::Max(1, $fallbackSteps.Count + 1)
+  $attempt = 1
 
-  while ($retry -le $maxRetries) {
-    Write-VerboseParallelLog -Message "Running ffmpeg test attempt $retry/$maxRetries with args: $testArgs" -JobId $JobId
+  while ($attempt -le $maxAttempts) {
+    Write-VerboseParallelLog -Message "Running ffmpeg test attempt $attempt/$maxAttempts ($($profile.Name)) with args: $testArgs" -JobId $JobId
 
     $p = New-Object System.Diagnostics.Process
     $p.StartInfo.FileName = $script:ffmpeg_exe
@@ -717,27 +1149,24 @@ function Invoke-EncodeTestWithFallback {
     $errSummary = "Unknown ffmpeg test error"
     if (-not [string]::IsNullOrWhiteSpace($err)) { $errSummary = ($err -split "`r?`n")[0].Trim() }
 
-    Write-ParallelLog -Message "Test command failed (attempt $retry/$maxRetries): $errSummary" -Level Warning -Target Both -JobId $JobId
+    Write-ParallelLog -Message "Test command failed (attempt $attempt/$maxAttempts): $errSummary" -Level Warning -Target Both -JobId $JobId
 
-    if (($retry -eq 1) -and $testArgs.Contains('-hwaccel cuda')) {
-      $testArgs = $testArgs.Replace('-hwaccel cuda', '-hwaccel auto')
-      Write-ParallelLog -Message "Fallback: switched hwaccel from cuda to auto." -Level Warning -Target Both -JobId $JobId
+    $fallbackIndex = $attempt - 1
+    if ($fallbackIndex -ge $fallbackSteps.Count) { break }
+
+    try {
+      $testArgs = & $fallbackSteps[$fallbackIndex] $testArgs
+      Write-ParallelLog -Message "Applying fallback step $($fallbackIndex + 1)/$($fallbackSteps.Count) for encoder '$($profile.Name)'." -Level Warning -Target Both -JobId $JobId
     }
-    elseif (($retry -eq 2) -and $testArgs.Contains('-hwaccel_output_format cuda')) {
-      $testArgs = $testArgs.Replace('-hwaccel_output_format cuda', '')
-      $testArgs = $testArgs.Replace('scale_cuda=', 'scale=').Replace(':interp_algo=lanczos', ':flags=lanczos')
-      Write-ParallelLog -Message "Fallback: removed hwaccel_output_format cuda and switched scaling to CPU filter." -Level Warning -Target Both -JobId $JobId
-    }
-    elseif (($retry -eq 3) -and $testArgs.Contains('-hwaccel auto')) {
-      $testArgs = $testArgs.Replace('-hwaccel auto', '')
-      Write-ParallelLog -Message "Fallback: disabled hwaccel as last resort." -Level Warning -Target Both -JobId $JobId
+    catch {
+      Write-ParallelLog -Message "Fallback step $($fallbackIndex + 1) failed: $($_.Exception.Message)" -Level Warning -Target Both -JobId $JobId
     }
 
-    Start-Sleep -Seconds ([Math]::Pow(2, $retry))
-    $retry++
+    Start-Sleep -Seconds ([Math]::Pow(2, $attempt))
+    $attempt++
   }
 
-  throw "ffmpeg test command failed after $maxRetries attempts."
+  throw "ffmpeg test command failed after $maxAttempts attempts for encoder '$($profile.Name)'."
 }
 
 function ConvertTo-BaseNameCodecTag {
@@ -941,7 +1370,13 @@ function Invoke-ArrRefresh {
 
   try {
     $typeName = [ArrType].GetEnumName($Type)
-    Start-ThreadJob -ScriptBlock $scriptBlock -ArgumentList $typeName, $TitleName, $BaseUri, $ApiKey | Out-Null
+    $job = Start-ThreadJob -ScriptBlock $scriptBlock -ArgumentList $typeName, $TitleName, $BaseUri, $ApiKey
+    [void]$script:ArrRefreshJobs.Add($job)
+    $script:ArrRefreshJobMeta[$job.Id] = [PSCustomObject]@{
+      SourceJobId = $JobId
+      TypeName    = $typeName
+      TitleName   = $TitleName
+    }
     Write-ParallelLog -Message "Arr refresh requested." -Target Both -JobId $JobId
   }
   catch {
@@ -982,13 +1417,19 @@ function Start-EncodeProcess {
   $progressTarget = "$($JobState.ProgressFile)"
   if ([string]::IsNullOrWhiteSpace($progressTarget)) { $progressTarget = "pipe:1" }
 
-  $ffmpegArgs = "-hide_banner -y -threads 0 -hwaccel cuda -hwaccel_output_format cuda -copy_unknown -analyzeduration 4GB -probesize 4GB "
+  if (-not $script:HWProfile) { throw "Hardware profile is not initialized." }
+  $hwProfile = $script:HWProfile
+  $hwaccelArgs = ''
+  if (-not [string]::IsNullOrWhiteSpace($hwProfile.HwaccelArgs)) {
+    $hwaccelArgs = "$($hwProfile.HwaccelArgs) "
+  }
+  $codecArgs = & $hwProfile.CodecArgs $script:CQPRateControlInt $bitrateArg
+
+  $ffmpegArgs = "-hide_banner -y -threads 0 ${hwaccelArgs}-copy_unknown -analyzeduration 4GB -probesize 4GB "
   $ffmpegArgs += "-nostats -stats_period 0.25 -progress `"$progressTarget`" -i `"$($item.FullName)`" "
   $ffmpegArgs += "$scaleArg -default_mode infer_no_subs -map 0:v:0 $audioMap $subMap -dn -map_metadata 0 -map_chapters 0 "
-  $ffmpegArgs += "-c:v hevc_nvenc -c:a copy -c:s copy "
-  $ffmpegArgs += "$bitrateArg-bufsize:v 5MB -preset:v p4 -tune:v hq -tier:v main -rc:v constqp "
-  $ffmpegArgs += "-init_qpI:v $($script:CQPRateControlInt) -init_qpP:v $($script:CQPRateControlInt + 1) -init_qpB:v $($script:CQPRateControlInt + 2) "
-  $ffmpegArgs += "-rc-lookahead:v 32 -spatial-aq:v 1 -aq-strength:v 8 -temporal-aq:v 1 -b_ref_mode:v 1 "
+  $ffmpegArgs += "-c:v $($hwProfile.Encoder) -c:a copy -c:s copy "
+  $ffmpegArgs += $codecArgs
   $ffmpegArgs += "-max_interleave_delta 500000 "
   $ffmpegArgs += "`"$($JobState.OutputFile)`""
 
@@ -1021,7 +1462,7 @@ function Start-EncodeProcess {
 
   # Open a per-job progress dump file for raw postmortem analysis.
   if ($LogVerbose) {
-    $dumpName = "ffmpeg_nvenc_h265_progress_job${JobId}_$(Get-Date -Format 'yyyyMMddHHmmss').log"
+    $dumpName = "${script:LogPrefix}_progress_job${JobId}_$(Get-Date -Format 'yyyyMMddHHmmss').log"
     $dumpPath = Join-Path $script:log_path $dumpName
     try {
       $sw = [System.IO.StreamWriter]::new($dumpPath, $false, [System.Text.Encoding]::UTF8)
@@ -1676,10 +2117,11 @@ $candidates = $null
 $canceledPendingCount = 0
 $runStarted = Get-Date
 Register-CancellationHandler
+$script:HWProfile = Get-HardwareEncoderProfile -PreferredEncoder $Encoder
 
 # Clean up old log files (main logs and progress dumps).
-$logFilter = Join-Path $script:log_path "ffmpeg_nvenc_h265_*.log"
-$progressFilter = Join-Path $script:log_path "ffmpeg_nvenc_h265_progress_job*.log"
+$logFilter = Join-Path $script:log_path "${script:LogPrefix}_*.log"
+$progressFilter = Join-Path $script:log_path "${script:LogPrefix}_progress_job*.log"
 $oldLogs = @(Get-Item -Path $logFilter, $progressFilter -ErrorAction SilentlyContinue | Where-Object {
     $_.FullName -ne $script:logFilePath -and $_.CreationTime -lt (Get-Date).AddMinutes(-60)
   })
@@ -1910,6 +2352,52 @@ finally {
         Write-Verbose "Unable to restore previous progress view: $($_.Exception.Message)"
       }
     }
+  }
+
+  if ($script:ArrRefreshJobs -and $script:ArrRefreshJobs.Count -gt 0) {
+    $arrJobs = @($script:ArrRefreshJobs)
+    $arrJobs | Wait-Job -Timeout 15 | Out-Null
+
+    foreach ($arrJob in $arrJobs) {
+      $meta = $null
+      if ($script:ArrRefreshJobMeta.ContainsKey($arrJob.Id)) {
+        $meta = $script:ArrRefreshJobMeta[$arrJob.Id]
+      }
+
+      $sourceJobId = 0
+      $arrTypeName = 'unknown'
+      $arrTitle = 'unknown'
+      if ($meta) {
+        $sourceJobId = $meta.SourceJobId
+        $arrTypeName = $meta.TypeName
+        $arrTitle = $meta.TitleName
+      }
+
+      if ($arrJob.State -eq 'Completed') {
+        try {
+          $null = Receive-Job -Job $arrJob -Keep -ErrorAction Stop
+          Write-ParallelLog -Message "Arr refresh completed (type='$arrTypeName', title='$arrTitle')." -Target Both -JobId $sourceJobId
+        }
+        catch {
+          Write-ParallelLog -Message "Arr refresh failed (type='$arrTypeName', title='$arrTitle'): $($_.Exception.Message)" -Level Warning -Target Both -JobId $sourceJobId
+        }
+      }
+      elseif ($arrJob.State -eq 'Failed') {
+        $reason = ''
+        if ($arrJob.ChildJobs -and $arrJob.ChildJobs.Count -gt 0 -and $arrJob.ChildJobs[0].JobStateInfo.Reason) {
+          $reason = $arrJob.ChildJobs[0].JobStateInfo.Reason.Message
+        }
+        if ([string]::IsNullOrWhiteSpace($reason)) { $reason = 'Thread job failed.' }
+        Write-ParallelLog -Message "Arr refresh failed (type='$arrTypeName', title='$arrTitle'): $reason" -Level Warning -Target Both -JobId $sourceJobId
+      }
+      else {
+        Write-ParallelLog -Message "Arr refresh did not complete before shutdown timeout (state=$($arrJob.State), type='$arrTypeName', title='$arrTitle')." -Level Warning -Target Both -JobId $sourceJobId
+      }
+    }
+
+    $arrJobs | Remove-Job -Force -ErrorAction SilentlyContinue
+    $script:ArrRefreshJobs.Clear()
+    $script:ArrRefreshJobMeta.Clear()
   }
 
   if ($script:LogMutex) {

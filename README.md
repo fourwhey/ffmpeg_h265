@@ -1,14 +1,14 @@
 # FFmpeg NVENC H.265 Parallel Encoder
 
-A PowerShell script for high-performance, parallel video transcoding using FFmpeg with NVIDIA NVENC hardware acceleration. This script is designed to efficiently convert large video libraries to H.265 (HEVC) format with support for concurrent processing, progress tracking, and media server integration.
+A PowerShell script for high-performance, parallel video transcoding using FFmpeg hardware acceleration (NVENC, AMF, QSV) with software fallback. This script is designed to efficiently convert large video libraries to H.265 (HEVC) format with support for concurrent processing, progress tracking, and media server integration.
 
 ## Purpose
 
-This script automates the batch conversion of video files to H.265 format using NVIDIA GPU hardware encoding. It's particularly useful for:
+This script automates the batch conversion of video files to H.265 format using available GPU hardware encoding. It's particularly useful for:
 
 - **Media Library Optimization**: Reduce storage requirements by converting existing video collections to efficient H.265 encoding
 - **Automated Processing**: Integrate with media management systems (Radarr/Sonarr) for seamless library maintenance
-- **High-Performance Encoding**: Leverage NVIDIA NVENC hardware acceleration for fast, parallel video processing
+- **High-Performance Encoding**: Leverage NVIDIA NVENC, AMD AMF, or Intel QSV for fast, parallel video processing
 - **Quality Control**: Maintain video quality while reducing file sizes through configurable quality settings
 
 ## Key Features
@@ -26,7 +26,7 @@ This script automates the batch conversion of video files to H.265 format using 
 
 - **PowerShell 7.5 or newer**
 - **FFmpeg/FFprobe**: Installed and reachable via `ffmpeg_path` (directory or full ffmpeg executable path)
-- **NVIDIA GPU**: With NVENC support for hardware encoding
+- **Hardware Encoder (optional, auto-detected)**: NVIDIA NVENC, AMD AMF, or Intel QSV
 - **OS**: Windows, Linux, or macOS with PowerShell 7.5+
 
 ## Configuration
@@ -274,6 +274,9 @@ Use environment variables as primary config (checked first), with ConfigPath as 
 | `-LastRunDate` | datetime | - | Only process files modified after this date |
 | `-SkipFileLock` | switch | false | Skip file lock check (process files even if in use) |
 | `-ConfigPath` | string | "" | Directory containing ffmpeg_nvenc_h265.config.json (overrides auto-discovery) |
+| `-Encoder` | string | "auto" | Encoder profile: `auto`, `nvenc`, `amf`, `qsv`, `software` |
+
+When `-Encoder auto` is used (default), the script detects available HEVC encoders from ffmpeg and picks one automatically. Set `-Encoder` to a specific value to bypass detection.
 
 ### Audio and Subtitle Language Behavior
 
@@ -351,11 +354,12 @@ After processing, the script triggers a refresh scan to update the media server 
 
 Upgrade to PowerShell 7.5+: Download from [PowerShell GitHub Releases](https://github.com/PowerShell/PowerShell/releases)
 
-### NVENC encoding fails
+### Hardware encoding fails
 
-- Verify NVIDIA GPU supports NVENC (GTX 600 series or newer)
+- Verify FFmpeg build includes your target encoder support: `ffmpeg -encoders | Select-String "hevc_nvenc|hevc_amf|hevc_qsv"`
+- Verify available hardware acceleration backends on this OS: `ffmpeg -hwaccels` (for example `cuda`, `qsv`, `vaapi`, `d3d11va`, `dxva2`, `vulkan`)
+- Force a specific backend when needed: `-Encoder nvenc`, `-Encoder amf`, `-Encoder qsv`, or `-Encoder software`
 - Update GPU drivers to latest version
-- Check FFmpeg build includes NVENC support: `ffmpeg -encoders | Select-String nvenc`
 
 ### Progress bars not displaying
 
@@ -395,7 +399,7 @@ All configurable settings are set via `ffmpeg_nvenc_h265.config.json`. See the *
 ## Performance Tips
 
 1. **Optimal Parallel Jobs**: Start with 3 jobs; monitor GPU usage and adjust accordingly
-2. **GPU Limits**: Most consumer NVIDIA GPUs support 2-3 concurrent NVENC sessions
+2. **GPU Limits**: Concurrent session limits depend on your backend and GPU model (NVENC/AMF/QSV)
 3. **Storage**: Use SSD for temp directory for better I/O performance
 4. **Network Shares**: Avoid encoding over network; copy files locally first
 5. **Priority**: Consider lowering process priority if using PC during encoding
