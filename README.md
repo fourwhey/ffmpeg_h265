@@ -53,18 +53,18 @@ For `log_path`, step 3 is different: if missing from env/config, the script fall
 
 ### Config File (Optional Fallback)
 
-Create a `ffmpeg_nvenc_h265.config.json` file with your settings. The script searches for this file in:
+Create a `ffmpeg_h265.config.json` file with your settings. The script searches for this file in:
 
 1. **Explicit path** - Use `-ConfigPath` parameter to specify location
 2. **Current directory** - Where you run the script from
 3. **Script directory** - Where the `.ps1` file is located
 
-**Example ffmpeg_nvenc_h265.config.json:**
+**Example ffmpeg_h265.config.json:**
 
 ```json
 {
   "ffmpeg_path": "C:\\ffmpeg",
-  "log_path": "V:\\Logs\\ffmpeg_nvenc_h265",
+  "log_path": "V:\\Logs\\ffmpeg_h265",
   "processed_path": "V:\\Processed",
   "processing_path": "V:\\ProcessingTemp",
   "media_path": "V:\\Media",
@@ -84,7 +84,7 @@ Use them when your library uses different names, for example `films` and `series
 
 Config file setup is optional. The default/primary configuration source is environment variables.
 
-1. (Optional) Copy `ffmpeg_nvenc_h265.config.example.json` to `ffmpeg_nvenc_h265.config.json` in your folder
+1. (Optional) Copy `ffmpeg_h265.config.example.json` to `ffmpeg_h265.config.json` in your folder
 2. (Optional) Edit the file with your actual API keys and paths
 3. Set environment variables for primary config values (see mapping below; `log_path` is optional)
 4. Run the script normally; if any value is missing from env vars, the script falls back to config file discovery
@@ -112,7 +112,7 @@ Mapping:
 
 ### ConfigPath Parameter
 
-Explicitly specify where to load ffmpeg_nvenc_h265.config.json from:
+Explicitly specify where to load ffmpeg_h265.config.json from:
 
 ```powershell
 .\ffmpeg_h265.ps1 -Path "C:\Videos" -ConfigPath "C:\MyConfigs"
@@ -222,7 +222,7 @@ Single-threaded conversion with forced 720p resize for quality testing, showing 
     -ConfigPath "C:\Users\Administrator\OneDrive\Documents"
 ```
 
-Explicitly specify config file location (overrides auto-discovery search). The script loads `ffmpeg_nvenc_h265.config.json` from the specified directory.
+Explicitly specify config file location (overrides auto-discovery search). The script loads `ffmpeg_h265.config.json` from the specified directory.
 
 #### Example 10: ConfigPath with Environment Variables
 
@@ -273,7 +273,7 @@ Use environment variables as primary config (checked first), with ConfigPath as 
 | `-SubLang` | string | "eng" | ISO 639-2 subtitle language code to keep; see language behavior below |
 | `-LastRunDate` | datetime | - | Only process files modified after this date |
 | `-SkipFileLock` | switch | false | Skip file lock check (process files even if in use) |
-| `-ConfigPath` | string | "" | Directory containing ffmpeg_nvenc_h265.config.json (overrides auto-discovery) |
+| `-ConfigPath` | string | "" | Directory containing ffmpeg_h265.config.json (overrides auto-discovery) |
 | `-Encoder` | string | "auto" | Encoder profile: `auto`, `nvenc`, `amf`, `qsv`, `software` |
 
 When `-Encoder auto` is used (default), the script detects available HEVC encoders from ffmpeg and picks one automatically. Set `-Encoder` to a specific value to bypass detection.
@@ -308,7 +308,7 @@ If the source file contains no audio or subtitle streams at all, the map is made
 
 ## Output Organization
 
-The script uses configurable paths for file organization (customize via ffmpeg_nvenc_h265.config.json):
+The script uses configurable paths for file organization (customize via ffmpeg_h265.config.json):
 
 **Example paths (in config):**
 - **Processing Temp**: `V:\ProcessingTemp`
@@ -326,14 +326,14 @@ When `-LogEnabled` is specified, logs are created in the configured log director
 Logs are written to `log_path` from config (or `FFMPEG_LOG_PATH` from environment variables).
 If `log_path` is not provided, the script uses config discovery locations (loaded config directory, then current directory, Documents, script directory).
 
-- **Main Log Format**: `ffmpeg_nvenc_h265_YYYYMMDDHHMMSSFFFF.log`
-- **Per-Job Progress Log Format**: `ffmpeg_nvenc_h265_progress_job{JobId}_YYYYMMDDHHMMSS.log` (when `-LogVerbose` is enabled)
+- **Main Log Format**: `ffmpeg_h265_YYYYMMDDHHMMSSFFFF.log`
+- **Per-Job Progress Log Format**: `ffmpeg_h265_progress_job{JobId}_YYYYMMDDHHMMSS.log` (when `-LogVerbose` is enabled)
 - **Auto-cleanup**: Logs older than 24 hours or smaller than 2KB are automatically removed
 - **Thread-safe**: Mutex-protected logging for parallel operations
 
 ## Media Server Integration
 
-The script integrates with Radarr and Sonarr for automatic library updates. Configure the base URLs and API keys in your `ffmpeg_nvenc_h265.config.json`:
+The script integrates with Radarr and Sonarr for automatic library updates. Configure the base URLs and API keys in your `ffmpeg_h265.config.json`:
 
 **Example configuration:**
 - **Radarr**: `http://192.168.10.15:7878`
@@ -379,9 +379,9 @@ Upgrade to PowerShell 7.5+: Download from [PowerShell GitHub Releases](https://g
 
 ## Advanced Customization
 
-All configurable settings are set via `ffmpeg_nvenc_h265.config.json`. See the **Configuration** section above for details.
+All configurable settings are set via `ffmpeg_h265.config.json`. See the **Configuration** section above for details.
 
-**Example ffmpeg_nvenc_h265.config.json with all settings:**
+**Example ffmpeg_h265.config.json with all settings:**
 
 ```json
 {
