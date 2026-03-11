@@ -115,7 +115,7 @@ Mapping:
 Explicitly specify where to load ffmpeg_nvenc_h265.config.json from:
 
 ```powershell
-.\ffmpeg_nvenc_h265.ps1 -Path "C:\Videos" -ConfigPath "C:\MyConfigs"
+.\ffmpeg_h265.ps1 -Path "C:\Videos" -ConfigPath "C:\MyConfigs"
 ```
 
 This overrides automatic discovery and only looks in the specified directory.
@@ -124,7 +124,7 @@ Alternatively, set the `FFENC_CONFIGPATH` environment variable to avoid passing 
 
 ```powershell
 $env:FFENC_CONFIGPATH = "C:\MyConfigs"
-.\ffmpeg_nvenc_h265.ps1 -Path "C:\Videos"
+.\ffmpeg_h265.ps1 -Path "C:\Videos"
 ```
 
 The `-ConfigPath` parameter takes precedence over the environment variable if both are set.
@@ -136,7 +136,7 @@ The `-ConfigPath` parameter takes precedence over the environment variable if bo
 Convert all video files in a directory using default settings. The `-Path` parameter accepts the full path to your media directory:
 
 ```powershell
-.\ffmpeg_nvenc_h265.ps1 -Path "V:\Media\TV Shows"
+.\ffmpeg_h265.ps1 -Path "V:\Media\TV Shows"
 ```
 
 The script automatically detects whether to refresh Radarr (Movies) or Sonarr (TV Shows) based on the path structure.
@@ -146,7 +146,7 @@ The script automatically detects whether to refresh Radarr (Movies) or Sonarr (T
 #### Example 1: Convert with Custom Quality and Parallel Jobs
 
 ```powershell
-.\ffmpeg_nvenc_h265.ps1 -Path "V:\Media\Movies" -MaxParallelJobs 4 -CQPRateControl 26
+.\ffmpeg_h265.ps1 -Path "V:\Media\Movies" -MaxParallelJobs 4 -CQPRateControl 26
 ```
 
 Converts movies with 4 parallel jobs and CQP quality level 26 (lower = higher quality).
@@ -154,7 +154,7 @@ Converts movies with 4 parallel jobs and CQP quality level 26 (lower = higher qu
 #### Example 2: Resize Videos to 1080p
 
 ```powershell
-.\ffmpeg_nvenc_h265.ps1 -Path "C:\Videos" -ResizeResolution "1920:1080" -RetainAspect -CanScaleDown
+.\ffmpeg_h265.ps1 -Path "C:\Videos" -ResizeResolution "1920:1080" -RetainAspect -CanScaleDown
 ```
 
 Resizes videos to 1080p, maintaining aspect ratio, only if the source is larger than 1080p.
@@ -162,7 +162,7 @@ Resizes videos to 1080p, maintaining aspect ratio, only if the source is larger 
 #### Example 3: Force Conversion with Bitrate Control
 
 ```powershell
-.\ffmpeg_nvenc_h265.ps1 -Path "V:\Media\TV Shows" -BitrateControl "6M" -ForceConvert -MaxParallelJobs 2
+.\ffmpeg_h265.ps1 -Path "V:\Media\TV Shows" -BitrateControl "6M" -ForceConvert -MaxParallelJobs 2
 ```
 
 Forces re-encoding using 6 Mbps bitrate limit, even if files are already H.265 encoded.
@@ -170,7 +170,7 @@ Forces re-encoding using 6 Mbps bitrate limit, even if files are already H.265 e
 #### Example 4: Enable Logging and Verbose Output
 
 ```powershell
-.\ffmpeg_nvenc_h265.ps1 -Path "C:\Videos" -LogEnabled -LogVerbose -ShowOutputCmd
+.\ffmpeg_h265.ps1 -Path "C:\Videos" -LogEnabled -LogVerbose -ShowOutputCmd
 ```
 
 Enables detailed logging with verbose output and displays FFmpeg commands being executed.
@@ -178,7 +178,7 @@ Enables detailed logging with verbose output and displays FFmpeg commands being 
 #### Example 5: Process Only Recent Files
 
 ```powershell
-.\ffmpeg_nvenc_h265.ps1 -Path "V:\Media\Movies" -LastRunDate (Get-Date).AddDays(-7)
+.\ffmpeg_h265.ps1 -Path "V:\Media\Movies" -LastRunDate (Get-Date).AddDays(-7)
 ```
 
 Only processes files modified in the last 7 days.
@@ -186,7 +186,7 @@ Only processes files modified in the last 7 days.
 #### Example 6: Custom Filtering and Sorting
 
 ```powershell
-.\ffmpeg_nvenc_h265.ps1 -Path "C:\Videos" `
+.\ffmpeg_h265.ps1 -Path "C:\Videos" `
     -UserFilter { $_.Length -gt 500MB } `
     -SortExpression @{ e = 'Length'; Descending = $true }
 ```
@@ -196,7 +196,7 @@ Processes only files larger than 500MB, starting with the largest files first.
 #### Example 7: Skip Post-Processing
 
 ```powershell
-.\ffmpeg_nvenc_h265.ps1 -Path "C:\Videos" -SkipMoveOnCompletion -SkipArrRefresh
+.\ffmpeg_h265.ps1 -Path "C:\Videos" -SkipMoveOnCompletion -SkipArrRefresh
 ```
 
 Converts videos but skips moving files to the processed folder and skips Radarr/Sonarr refresh.
@@ -204,7 +204,7 @@ Converts videos but skips moving files to the processed folder and skips Radarr/
 #### Example 8: Quality Comparison with Resize
 
 ```powershell
-.\ffmpeg_nvenc_h265.ps1 -Path "C:\Test" `
+.\ffmpeg_h265.ps1 -Path "C:\Test" `
     -ResizeResolution "1280:720" `
     -ForceResize `
     -RetainAspect `
@@ -218,7 +218,7 @@ Single-threaded conversion with forced 720p resize for quality testing, showing 
 #### Example 9: Using ConfigPath for Explicit Config Location
 
 ```powershell
-.\ffmpeg_nvenc_h265.ps1 -Path "V:\Media\TV Shows" `
+.\ffmpeg_h265.ps1 -Path "V:\Media\TV Shows" `
     -ConfigPath "C:\Users\Administrator\OneDrive\Documents"
 ```
 
@@ -233,7 +233,7 @@ $env:FFMPEG_PROCESSED_PATH = "V:\Processed"
 $env:FFMPEG_PROCESSING_PATH = "V:\ProcessingTemp"
 $env:FFMPEG_MEDIA_PATH = "V:\Media"
 
-.\ffmpeg_nvenc_h265.ps1 -Path "V:\Media\Movies" -ConfigPath "D:\Configs" -MaxParallelJobs 4
+.\ffmpeg_h265.ps1 -Path "V:\Media\Movies" -ConfigPath "D:\Configs" -MaxParallelJobs 4
 ```
 
 Use environment variables as primary config (checked first), with ConfigPath as fallback for any config file values. This is ideal for containerized/cloud deployments where env vars are preferred.
