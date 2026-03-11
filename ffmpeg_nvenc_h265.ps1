@@ -898,14 +898,14 @@ function Get-HardwareEncoderProfile {
   function New-HwAccelOption {
     param(
       [Parameter(Mandatory = $true)][string]$Name,
-      [Parameter(Mandatory = $false)][string]$Args = '',
+      [Parameter(Mandatory = $false)][string]$HwaccelArgs = '',
       [Parameter(Mandatory = $true)][string]$ScaleFilter,
       [Parameter(Mandatory = $false)][string]$ScaleSuffix = ''
     )
 
     return [PSCustomObject]@{
       Name        = $Name
-      Args        = $Args
+      Args        = $HwaccelArgs
       ScaleFilter = $ScaleFilter
       ScaleSuffix = $ScaleSuffix
     }
@@ -959,8 +959,8 @@ function Get-HardwareEncoderProfile {
       $fromOpt = $HwAccelOptions[$i]
       $toOpt   = $HwAccelOptions[$i + 1]
       $fallbackChain += {
-        param([string]$Args)
-        $next = $Args
+        param([string]$HwaccelArgs)
+        $next = $HwaccelArgs
         if ($fromOpt.Args -ne $toOpt.Args) {
           $next = $next.Replace($fromOpt.Args, $toOpt.Args)
         }
@@ -1111,17 +1111,17 @@ function Invoke-EncodeTestWithFallback {
     [Parameter(Mandatory = $true)][int]$JobId
   )
 
-  $profile = $script:HWProfile
-  if (-not $profile) { throw "Hardware profile is not initialized." }
+  $hwProfile = $script:HWProfile
+  if (-not $hwProfile) { throw "Hardware profile is not initialized." }
 
   $nullSinkArgs = "-ss 0 -to 10 -f null $($script:NullDevice)"
   $testArgs = $FFmpegArgs.Replace('"' + $OutputFile + '"', $nullSinkArgs)
-  $fallbackSteps = @($profile.FallbackChain)
+  $fallbackSteps = @($hwProfile.FallbackChain)
   $maxAttempts = [Math]::Max(1, $fallbackSteps.Count + 1)
   $attempt = 1
 
   while ($attempt -le $maxAttempts) {
-    Write-VerboseParallelLog -Message "Running ffmpeg test attempt $attempt/$maxAttempts ($($profile.Name)) with args: $testArgs" -JobId $JobId
+    Write-VerboseParallelLog -Message "Running ffmpeg test attempt $attempt/$maxAttempts ($($hwProfile.Name)) with args: $testArgs" -JobId $JobId
 
     $p = New-Object System.Diagnostics.Process
     $p.StartInfo.FileName = $script:ffmpeg_exe
@@ -1156,7 +1156,7 @@ function Invoke-EncodeTestWithFallback {
 
     try {
       $testArgs = & $fallbackSteps[$fallbackIndex] $testArgs
-      Write-ParallelLog -Message "Applying fallback step $($fallbackIndex + 1)/$($fallbackSteps.Count) for encoder '$($profile.Name)'." -Level Warning -Target Both -JobId $JobId
+      Write-ParallelLog -Message "Applying fallback step $($fallbackIndex + 1)/$($fallbackSteps.Count) for encoder '$($hwProfile.Name)'." -Level Warning -Target Both -JobId $JobId
     }
     catch {
       Write-ParallelLog -Message "Fallback step $($fallbackIndex + 1) failed: $($_.Exception.Message)" -Level Warning -Target Both -JobId $JobId
@@ -1166,7 +1166,7 @@ function Invoke-EncodeTestWithFallback {
     $attempt++
   }
 
-  throw "ffmpeg test command failed after $maxAttempts attempts for encoder '$($profile.Name)'."
+  throw "ffmpeg test command failed after $maxAttempts attempts for encoder '$($hwProfile.Name)'."
 }
 
 function ConvertTo-BaseNameCodecTag {
