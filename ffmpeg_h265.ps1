@@ -1041,27 +1041,27 @@ function Get-HardwareEncoderProfile {
   }
 
   $nvencOptions = @(
-    (New-HwAccelOption -Name 'cuda' -Args '-hwaccel cuda -hwaccel_output_format cuda' -ScaleFilter 'scale_cuda' -ScaleSuffix ':interp_algo=lanczos')
-    (New-HwAccelOption -Name 'cuda' -Args '-hwaccel cuda'                             -ScaleFilter 'scale_cuda' -ScaleSuffix ':interp_algo=lanczos')
-    (New-HwAccelOption -Name 'auto' -Args '-hwaccel auto'                             -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
-    (New-HwAccelOption -Name 'none' -Args ''                                          -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'cuda' -HwaccelArgs '-hwaccel cuda -hwaccel_output_format cuda' -ScaleFilter 'scale_cuda' -ScaleSuffix ':interp_algo=lanczos')
+    (New-HwAccelOption -Name 'cuda' -HwaccelArgs '-hwaccel cuda'                             -ScaleFilter 'scale_cuda' -ScaleSuffix ':interp_algo=lanczos')
+    (New-HwAccelOption -Name 'auto' -HwaccelArgs '-hwaccel auto'                             -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'none' -HwaccelArgs ''                                          -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
   )
 
   $amfOptions = @(
-    (New-HwAccelOption -Name 'd3d11va' -Args '-hwaccel d3d11va -hwaccel_output_format d3d11' -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
-    (New-HwAccelOption -Name 'dxva2'   -Args '-hwaccel dxva2'                               -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
-    (New-HwAccelOption -Name 'vaapi'   -Args '-hwaccel vaapi -hwaccel_output_format vaapi'  -ScaleFilter 'scale_vaapi' -ScaleSuffix ':format=nv12')
-    (New-HwAccelOption -Name 'vulkan'  -Args '-hwaccel vulkan -hwaccel_output_format vulkan' -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
-    (New-HwAccelOption -Name 'auto'    -Args '-hwaccel auto'                                -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
-    (New-HwAccelOption -Name 'none'    -Args ''                                             -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'd3d11va' -HwaccelArgs '-hwaccel d3d11va -hwaccel_output_format d3d11' -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'dxva2'   -HwaccelArgs '-hwaccel dxva2'                               -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'vaapi'   -HwaccelArgs '-hwaccel vaapi -hwaccel_output_format vaapi'  -ScaleFilter 'scale_vaapi' -ScaleSuffix ':format=nv12')
+    (New-HwAccelOption -Name 'vulkan'  -HwaccelArgs '-hwaccel vulkan -hwaccel_output_format vulkan' -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'auto'    -HwaccelArgs '-hwaccel auto'                                -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'none'    -HwaccelArgs ''                                             -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
   )
 
   $qsvOptions = @(
-    (New-HwAccelOption -Name 'qsv'   -Args '-hwaccel qsv -hwaccel_output_format qsv'   -ScaleFilter 'scale_qsv'   -ScaleSuffix '')
-    (New-HwAccelOption -Name 'qsv'   -Args '-hwaccel qsv'                               -ScaleFilter 'scale'       -ScaleSuffix ':flags=lanczos')
-    (New-HwAccelOption -Name 'vaapi' -Args '-hwaccel vaapi -hwaccel_output_format vaapi' -ScaleFilter 'scale_vaapi' -ScaleSuffix ':format=nv12')
-    (New-HwAccelOption -Name 'auto'  -Args '-hwaccel auto'                              -ScaleFilter 'scale'       -ScaleSuffix ':flags=lanczos')
-    (New-HwAccelOption -Name 'none'  -Args ''                                           -ScaleFilter 'scale'       -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'qsv'   -HwaccelArgs '-hwaccel qsv -hwaccel_output_format qsv'   -ScaleFilter 'scale_qsv'   -ScaleSuffix '')
+    (New-HwAccelOption -Name 'qsv'   -HwaccelArgs '-hwaccel qsv'                               -ScaleFilter 'scale'       -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'vaapi' -HwaccelArgs '-hwaccel vaapi -hwaccel_output_format vaapi' -ScaleFilter 'scale_vaapi' -ScaleSuffix ':format=nv12')
+    (New-HwAccelOption -Name 'auto'  -HwaccelArgs '-hwaccel auto'                              -ScaleFilter 'scale'       -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'none'  -HwaccelArgs ''                                           -ScaleFilter 'scale'       -ScaleSuffix ':flags=lanczos')
   )
 
   $nvencProfile = Build-Profile -ProfileName 'nvenc' -Encoder 'hevc_nvenc' -CodecArgs {
