@@ -9,5 +9,6 @@
   "radarr_baseUri": "http://localhost:7878",
   "radarr_apiKey": "your-radarr-api-key-here",
   "sonarr_baseUri": "http://localhost:8989",
-  "sonarr_apiKey": "your-sonarr-api-key-here"
+  "sonarr_apiKey": "your-sonarr-api-key-here",
+  "arr_refresh_timeout_seconds": 60
 }
