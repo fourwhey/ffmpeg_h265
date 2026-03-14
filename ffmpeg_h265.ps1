@@ -401,6 +401,12 @@ $radarr_baseUri = Get-ConfigValue -ConfigKey "radarr_baseUri" -EnvVarName "RADAR
 $radarr_apiKey = Get-ConfigValue -ConfigKey "radarr_apiKey" -EnvVarName "RADARR_API_KEY" -ConfigData $configData
 $sonarr_baseUri = Get-ConfigValue -ConfigKey "sonarr_baseUri" -EnvVarName "SONARR_BASE_URI" -ConfigData $configData
 $sonarr_apiKey = Get-ConfigValue -ConfigKey "sonarr_apiKey" -EnvVarName "SONARR_API_KEY" -ConfigData $configData
+$script:ArrRefreshTimeoutSeconds = Get-OptionalConfigValue -ConfigKey "arr_refresh_timeout_seconds" -EnvVarName "FFENC_ARR_REFRESH_TIMEOUT_SECONDS" -ConfigData $configData
+if ([string]::IsNullOrWhiteSpace([string]$script:ArrRefreshTimeoutSeconds) -or -not [int]::TryParse($script:ArrRefreshTimeoutSeconds, [ref]$null)) {
+  $script:ArrRefreshTimeoutSeconds = 15
+} else {
+  $script:ArrRefreshTimeoutSeconds = [int]$script:ArrRefreshTimeoutSeconds
+}
 
 $script:NullDevice = if ($IsWindows) { 'NUL' } else { '/dev/null' }
 $ffmpegExeName = if ($IsWindows) { 'ffmpeg.exe' } else { 'ffmpeg' }
@@ -2356,7 +2362,7 @@ finally {
 
   if ($script:ArrRefreshJobs -and $script:ArrRefreshJobs.Count -gt 0) {
     $arrJobs = @($script:ArrRefreshJobs)
-    $arrJobs | Wait-Job -Timeout 15 | Out-Null
+    $arrJobs | Wait-Job -Timeout $script:ArrRefreshTimeoutSeconds | Out-Null
 
     foreach ($arrJob in $arrJobs) {
       $meta = $null

@@ -73,12 +73,15 @@ Create a `ffmpeg_h265.config.json` file with your settings. The script searches 
   "radarr_baseUri": "http://192.168.10.15:7878",
   "radarr_apiKey": "your-radarr-api-key-here",
   "sonarr_baseUri": "http://192.168.10.15:8989",
-  "sonarr_apiKey": "your-sonarr-api-key-here"
+  "sonarr_apiKey": "your-sonarr-api-key-here",
+  "arr_refresh_timeout_seconds": 60
 }
 ```
 
 `movies_subfolder` and `tv_shows_subfolder` are optional. They default to `Movies` and `TV Shows`.
 Use them when your library uses different names, for example `films` and `series`.
+
+`arr_refresh_timeout_seconds` controls how long the script waits for Radarr/Sonarr refresh operations to complete (default: 15 seconds). Increase this value if you have large libraries that take longer to refresh.
 
 **Setup:**
 
@@ -108,6 +111,7 @@ Mapping:
 - `radarr_apiKey` → `RADARR_API_KEY`
 - `sonarr_baseUri` → `SONARR_BASE_URI`
 - `sonarr_apiKey` → `SONARR_API_KEY`
+- `arr_refresh_timeout_seconds` (optional) → `FFENC_ARR_REFRESH_TIMEOUT_SECONDS`
 - `-ConfigPath` parameter (optional) → `FFENC_CONFIGPATH`
 
 ### ConfigPath Parameter
