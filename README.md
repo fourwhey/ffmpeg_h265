@@ -21,6 +21,83 @@ This script automates the batch conversion of video files to H.265 format using 
 - **Thread-safe Logging**: Detailed logging with job-specific tracking and verbose mode
 - **Graceful Cancellation**: Ctrl+C handling with proper cleanup of running processes
 - **Incremental Processing**: Skip already-converted files and resume interrupted batches
+- **Metadata Analysis Mode**: Scan video libraries and generate comprehensive metadata reports with HTML visualization
+
+## Metadata Analysis Mode
+
+The script supports a metadata analysis mode (`-Analyze`) that scans video files, extracts detailed metadata, and generates reports without performing any encoding.
+
+### Features
+
+- **Comprehensive Metadata**: Collects file hashes, timestamps, video/audio/subtitle details, and FFprobe data
+- **NDJSON Output**: Appends metadata to a newline-delimited JSON file for efficient processing
+- **Index Sidecar**: Maintains a fast-lookup index with file offsets and timestamps
+- **HTML Reports**: Generates an interactive dark-theme dashboard with top-level filters, metric cards, and searchable metadata tables
+- **Automatic Compaction**: Removes entries for deleted files and maintains current state
+- **Parallel Run Prevention**: Uses mutex to prevent concurrent analysis runs on the same directory
+- **Hash Strategies**: Supports `size-mtime` change tracking (Analyze default, fastest), plus MD5 and SHA256 content hashing
+
+### Usage
+
+```powershell
+# Basic analysis (default uses size+mtime change tracking for speed)
+.\ffmpeg_h265.ps1 -Path "Z:\Movies" -Analyze
+
+# Force MD5 content hashing
+.\ffmpeg_h265.ps1 -Path "Z:\Movies" -Analyze -HashAlgorithm md5
+
+# Use SHA256 for stronger hashing
+.\ffmpeg_h265.ps1 -Path "Z:\Movies" -Analyze -HashAlgorithm sha256
+
+# Compact existing metadata (remove deleted files)
+.\ffmpeg_h265.ps1 -Path "Z:\Movies" -Compact
+```
+
+### Output Files
+
+Analysis creates the following files in the resolved log/output directory (`log_path` / `FFENC_LOG_PATH`):
+
+- `metadata.ndjson`: Newline-delimited JSON with one metadata object per line
+- `metadata_index.json`: Index array for fast lookup by path and timestamp
+- `metadata_report.html`: HTML table visualization of library metadata
+
+### Repository Samples
+
+The repository includes sample analysis artifacts that are intended to work standalone when opened locally:
+
+- `metadata.ndjson`: sample NDJSON metadata data
+- `metadata_index.json`: sample index sidecar
+- `metadata_report.html`: self-contained sample dark-theme report generated from sample NDJSON
+- The HTML report template is embedded in the script and generated at runtime (there is no standalone template file in the repo)
+
+These sample files are examples only. Runtime Analyze output is still written to your configured output directory (`log_path` / `FFENC_LOG_PATH`).
+
+### Metadata Schema
+
+Each NDJSON entry contains:
+
+```json
+{
+  "path": "Z:/Movies/Big Buck Bunny (2008)/Big.Buck.Bunny.2008.mkv",
+  "size": 734003200,
+  "mtime": "2026-03-16T12:00:00Z",
+  "ctime": "2026-03-16T12:00:00Z",
+  "hash": "size-mtime:734003200:638777184000000000",
+  "duration": 596,
+  "video": {
+    "codec": "h264",
+    "bitrate": 8500000,
+    "width": 1920,
+    "height": 1080,
+    "hdr": false
+  },
+  "audio": [
+    { "lang": "eng", "codec": "ogg", "channels": 2 }
+  ],
+  "subtitles": ["eng"],
+  "tags": ["movie", "drama"]
+}
+```
 
 ## Requirements
 
@@ -119,7 +196,7 @@ Mapping:
 Explicitly specify where to load ffmpeg_h265.config.json from:
 
 ```powershell
-.\ffmpeg_h265.ps1 -Path "C:\Videos" -ConfigPath "C:\MyConfigs"
+.\ffmpeg_h265.ps1 -Path "V:\Videos" -ConfigPath "D:\Configs"
 ```
 
 This overrides automatic discovery and only looks in the specified directory.
@@ -127,8 +204,8 @@ This overrides automatic discovery and only looks in the specified directory.
 Alternatively, set the `FFENC_CONFIGPATH` environment variable to avoid passing the parameter each time:
 
 ```powershell
-$env:FFENC_CONFIGPATH = "C:\MyConfigs"
-.\ffmpeg_h265.ps1 -Path "C:\Videos"
+$env:FFENC_CONFIGPATH = "D:\Configs"
+.\ffmpeg_h265.ps1 -Path "V:\Videos"
 ```
 
 The `-ConfigPath` parameter takes precedence over the environment variable if both are set.
@@ -158,7 +235,7 @@ Converts movies with 4 parallel jobs and CQP quality level 26 (lower = higher qu
 #### Example 2: Resize Videos to 1080p
 
 ```powershell
-.\ffmpeg_h265.ps1 -Path "C:\Videos" -ResizeResolution "1920:1080" -RetainAspect -CanScaleDown
+.\ffmpeg_h265.ps1 -Path "V:\Videos" -ResizeResolution "1920:1080" -RetainAspect -CanScaleDown
 ```
 
 Resizes videos to 1080p, maintaining aspect ratio, only if the source is larger than 1080p.
@@ -174,7 +251,7 @@ Forces re-encoding using 6 Mbps bitrate limit, even if files are already H.265 e
 #### Example 4: Enable Logging and Verbose Output
 
 ```powershell
-.\ffmpeg_h265.ps1 -Path "C:\Videos" -LogEnabled -LogVerbose -ShowOutputCmd
+.\ffmpeg_h265.ps1 -Path "V:\Videos" -LogEnabled -LogVerbose -ShowOutputCmd
 ```
 
 Enables detailed logging with verbose output and displays FFmpeg commands being executed.
@@ -190,7 +267,7 @@ Only processes files modified in the last 7 days.
 #### Example 6: Custom Filtering and Sorting
 
 ```powershell
-.\ffmpeg_h265.ps1 -Path "C:\Videos" `
+.\ffmpeg_h265.ps1 -Path "V:\Videos" `
     -UserFilter { $_.Length -gt 500MB } `
     -SortExpression @{ e = 'Length'; Descending = $true }
 ```
@@ -200,7 +277,7 @@ Processes only files larger than 500MB, starting with the largest files first.
 #### Example 7: Skip Post-Processing
 
 ```powershell
-.\ffmpeg_h265.ps1 -Path "C:\Videos" -SkipMoveOnCompletion -SkipArrRefresh
+.\ffmpeg_h265.ps1 -Path "V:\Videos" -SkipMoveOnCompletion -SkipArrRefresh
 ```
 
 Converts videos but skips moving files to the processed folder and skips Radarr/Sonarr refresh.
@@ -208,7 +285,7 @@ Converts videos but skips moving files to the processed folder and skips Radarr/
 #### Example 8: Quality Comparison with Resize
 
 ```powershell
-.\ffmpeg_h265.ps1 -Path "C:\Test" `
+.\ffmpeg_h265.ps1 -Path "V:\Test" `
     -ResizeResolution "1280:720" `
     -ForceResize `
     -RetainAspect `
@@ -223,7 +300,7 @@ Single-threaded conversion with forced 720p resize for quality testing, showing 
 
 ```powershell
 .\ffmpeg_h265.ps1 -Path "V:\Media\TV Shows" `
-    -ConfigPath "C:\Users\Administrator\OneDrive\Documents"
+    -ConfigPath "D:\Configs"
 ```
 
 Explicitly specify config file location (overrides auto-discovery search). The script loads `ffmpeg_h265.config.json` from the specified directory.
@@ -231,7 +308,7 @@ Explicitly specify config file location (overrides auto-discovery search). The s
 #### Example 10: ConfigPath with Environment Variables
 
 ```powershell
-$env:FFMPEG_PATH = "C:\ffmpeg"
+$env:FFMPEG_PATH = "V:\ffmpeg"
 $env:FFMPEG_LOG_PATH = "V:\Logs"
 $env:FFMPEG_PROCESSED_PATH = "V:\Processed"
 $env:FFMPEG_PROCESSING_PATH = "V:\ProcessingTemp"
@@ -273,8 +350,8 @@ Use environment variables as primary config (checked first), with ConfigPath as 
 | `-ExitOnError` | switch | false | Stop all processing if any job fails |
 | `-SortExpression` | hashtable | Name, Ascending | Sort order for processing files |
 | `-UserFilter` | scriptblock | All files | Custom filter for selecting files |
-| `-AudioLang` | string | "eng" | ISO 639-2 audio language code to keep; see language behavior below |
-| `-SubLang` | string | "eng" | ISO 639-2 subtitle language code to keep; see language behavior below |
+| `-AudioLang` | string[] | @("eng","jpn") | ISO 639-2 audio language codes to keep; supports one or many values |
+| `-SubLang` | string[] | @("eng") | ISO 639-2 subtitle language codes to keep; supports one or many values |
 | `-LastRunDate` | datetime | - | Only process files modified after this date |
 | `-SkipFileLock` | switch | false | Skip file lock check (process files even if in use) |
 | `-ConfigPath` | string | "" | Directory containing ffmpeg_h265.config.json (overrides auto-discovery) |
@@ -284,15 +361,30 @@ When `-Encoder auto` is used (default), the script detects available HEVC encode
 
 ### Audio and Subtitle Language Behavior
 
-Both `-AudioLang` and `-SubLang` accept an [ISO 639-2](https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes) three-letter language code (e.g. `eng`, `jpn`, `fra`) or one of the special values below.
+Both `-AudioLang` and `-SubLang` accept one or more [ISO 639-2](https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes) three-letter language codes. Current defaults: `-AudioLang @("eng","jpn")` and `-SubLang @("eng")`.
+
+String and array forms are both acceptable for `-AudioLang` and `-SubLang`.
+Examples: `-AudioLang eng`, `-AudioLang @("eng","jpn")`, `-SubLang eng`, `-SubLang @("eng")`.
+
+Special values are supported in either singular or array form.
 
 | Value | Outcome |
 |---|---|
-| `eng` (or any language code) | Only streams tagged with that language are kept. If no matching streams exist in the file, **all** streams of that type are kept as a fallback. |
+| `eng` (or any single language code) | Only streams tagged with that language are kept. If no matching streams exist in the file, **all** streams of that type are kept as a fallback. |
+| `@("eng","jpn")` | Streams matching any listed language are kept. Languages are applied in the order provided. If no matching streams exist, **all** streams of that type are kept as a fallback. |
 | `all` | All streams of that type are kept regardless of language tag. |
 | `nomap` or `none` | No streams of that type are mapped — the track is completely excluded from the output. |
 
 If the source file contains no audio or subtitle streams at all, the map is made optional so ffmpeg does not error out.
+
+### Default Stream Selection
+
+When audio/subtitle streams are mapped, the script explicitly sets a default output audio stream and default output subtitle stream via ffmpeg disposition flags.
+
+- Default is selected from the mapped output streams (in mapped order)
+- The script prefers non-commentary/non-descriptive tracks for default when possible
+- If all mapped tracks look like commentary/descriptive variants, it still sets a deterministic default
+- If no streams of that type are mapped, no default disposition is set for that type
 
 ## Quality Settings Guide
 

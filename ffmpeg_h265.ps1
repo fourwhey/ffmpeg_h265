@@ -31,19 +31,22 @@ param(
   [Parameter(Mandatory = $false)][switch] $ExitOnError,
   [Parameter(Mandatory = $false)][hashtable] $SortExpression = @{ e = 'Name'; Descending = $false },
   [Parameter(Mandatory = $false)][scriptblock] $UserFilter = { $_.Length -ne -1 },
-  [Parameter(Mandatory = $false)][string] $AudioLang = "eng",
-  [Parameter(Mandatory = $false)][string] $SubLang = "eng",
+  [Parameter(Mandatory = $false)][string[]] $AudioLang = @("eng", "jpn"),
+  [Parameter(Mandatory = $false)][string[]] $SubLang = @("eng"),
   [Parameter(Mandatory = $false)][datetime] $LastRunDate,
   [Parameter(Mandatory = $false)][switch] $SkipFileLock = $false,
   [Parameter(Mandatory = $false, HelpMessage = "Directory containing the .config.json file")][string] $ConfigPath = "",
-  [Parameter(Mandatory = $false, HelpMessage = "Hardware encoder profile: auto, nvenc, amf, qsv, software")][ValidateSet('auto', 'nvenc', 'amf', 'qsv', 'software')][string] $Encoder = 'auto'
+  [Parameter(Mandatory = $false, HelpMessage = "Hardware encoder profile: auto, nvenc, amf, qsv, software")][ValidateSet('auto', 'nvenc', 'amf', 'qsv', 'software')][string] $Encoder = 'auto',
+  [Parameter(Mandatory = $false)][switch] $Analyze,
+  [Parameter(Mandatory = $false)][ValidateSet('md5', 'sha256', 'size-mtime')][string] $HashAlgorithm = 'size-mtime',
+  [Parameter(Mandatory = $false)][switch] $Compact
 )
 
 $ShowProgress = -not $NoProgress.IsPresent
 $script:CanRenderProgress = $ShowProgress
 $MoveOnCompletion = -not $SkipMoveOnCompletion.IsPresent
 $RefreshArrOnCompletion = -not $SkipArrRefresh.IsPresent
-$script:LogEnabled = $LogEnabled.IsPresent
+$script:LogEnabled = ($LogEnabled.IsPresent -or $Analyze.IsPresent -or $Compact.IsPresent)
 $script:StopRequested = $false
 $script:CQPRateControlInt = 0
 $script:ShowOutputCmdEnabled = $ShowOutputCmd.IsPresent
@@ -62,6 +65,11 @@ $script:CandidateQueueRef = $null
 $script:TotalWorkCount = 0
 $script:FFprobeTimeoutSeconds = 90
 $script:HWProfile = $null
+$script:AnalyzeTempArtifacts = [System.Collections.Generic.List[string]]::new()
+
+if ($Analyze.IsPresent -and (-not $PSBoundParameters.ContainsKey('HashAlgorithm'))) {
+  $HashAlgorithm = 'size-mtime'
+}
 
 if ($PSVersionTable.PSVersion -lt [version]'7.5.0') {
   throw "This script requires PowerShell 7.5 or newer. Current version: $($PSVersionTable.PSVersion)"
@@ -89,12 +97,15 @@ $script:RunConfig = [ordered]@{
   ExitOnError          = $ExitOnError.IsPresent
   SortExpression       = $SortExpression
   UserFilterDefined    = ($null -ne $UserFilter)
-  AudioLang            = $AudioLang
-  SubLang              = $SubLang
+  AudioLang            = ($AudioLang -join ',')
+  SubLang              = ($SubLang -join ',')
   LastRunDate          = $LastRunDate
   SkipFileLock         = $SkipFileLock.IsPresent
   ConfigPath           = $ConfigPath
   Encoder              = $Encoder
+  Analyze              = $Analyze.IsPresent
+  Compact              = $Compact.IsPresent
+  HashAlgorithm        = $HashAlgorithm
 }
 
 if (-not [int]::TryParse($CQPRateControl, [ref]$script:CQPRateControlInt)) {
@@ -352,12 +363,18 @@ function Resolve-Config {
   }
 }
 
-$resolvedConfig = Resolve-Config -ExplicitConfigPath $ConfigPath -CandidateConfigFileNames @($script:ConfigFileNames) -AutoDiscoveryLocations @(
+$autoDiscoveryLocations = @(
   $PWD.Path,
   $script:CallerScriptDir,
   $script:InvokedScriptDir,
   $script:ScriptRoot
-)
+) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+if (-not $autoDiscoveryLocations -or $autoDiscoveryLocations.Count -eq 0) {
+  $autoDiscoveryLocations = @($PWD.Path)
+}
+
+$resolvedConfig = Resolve-Config -ExplicitConfigPath $ConfigPath -CandidateConfigFileNames @($script:ConfigFileNames) -AutoDiscoveryLocations $autoDiscoveryLocations
 
 $configData = $resolvedConfig.ConfigData
 $configLocations = @($resolvedConfig.ConfigLocations)
@@ -582,6 +599,8 @@ else {
   Write-ParallelLog -Message "No configuration file found. Searched: $searchedPaths" -Level Warning -Target Both
 }
 
+Write-ParallelLog -Message "Resolved log output path: '$($script:logFilePath)' (LogEnabled=$script:LogEnabled)." -Target Both
+
 function Read-FFmpegProgressLine {
   [CmdletBinding()]
   [OutputType([PSCustomObject])]
@@ -608,12 +627,19 @@ function Read-FFmpegProgressLine {
 
 function Get-FFprobeJson {
   [OutputType([PSCustomObject])]
-  param([string]$InputPath)
+  param(
+    [Parameter(Mandatory = $true)][string]$InputPath,
+    [Parameter(Mandatory = $false)][switch]$AnalyzeMode
+  )
 
   if ($script:StopRequested -or $script:CancellationToken.IsCancellationRequested) { return $null }
 
   $ffprobeExe = $script:ffprobe_exe
   $ffprobeArgs = "`"$InputPath`" -v quiet -hide_banner -analyzeduration 4GB -probesize 4GB -show_format -show_streams -print_format json -sexagesimal"
+  if ($AnalyzeMode) {
+    # Analysis mode only needs metadata; lighter probe settings reduce per-file latency.
+    $ffprobeArgs = "`"$InputPath`" -v quiet -hide_banner -analyzeduration 200M -probesize 50M -show_format -show_streams -print_format json"
+  }
 
   $probeProcess = New-Object System.Diagnostics.Process
   $probeProcess.StartInfo.FileName = $ffprobeExe
@@ -842,34 +868,155 @@ function Get-ScaleArgumentFromProbe {
 }
 
 function Get-AudioMapArg {
-  param([string]$AudioLangValue, [object[]]$AudioStreams)
+  param([string[]]$AudioLangValue, [object[]]$AudioStreams)
+
+  $langValues = @($AudioLangValue | ForEach-Object {
+      if ($null -eq $_) { return }
+      foreach ($part in ("$_" -split ',')) {
+        $token = $part.Trim().ToLowerInvariant()
+        if (-not [string]::IsNullOrWhiteSpace($token)) { $token }
+      }
+    } | Select-Object -Unique)
+  if ($langValues.Count -eq 0) { $langValues = @('eng') }
 
   $audioCount = @($AudioStreams).Count
-  if ($AudioLangValue -ieq "nomap" -or $AudioLangValue -ieq "none") { return "" }
-  if ($AudioLangValue -ieq "all") {
+  if ($langValues -contains "nomap" -or $langValues -contains "none") { return "" }
+  if ($langValues -contains "all") {
     if ($audioCount -eq 0) { return "-map 0:a?" }
     return "-map 0:a"
   }
 
-  $matching = @($AudioStreams | Where-Object { $_.tags -and $_.tags.language -ieq $AudioLangValue })
-  if ($matching.Count -gt 0) { return "-map 0:a:m:language:$AudioLangValue" }
+  $mapArgs = New-Object System.Collections.Generic.List[string]
+  foreach ($lang in $langValues) {
+    $matching = @($AudioStreams | Where-Object { $_.tags -and $_.tags.language -ieq $lang })
+    if ($matching.Count -gt 0) {
+      [void]$mapArgs.Add("-map 0:a:m:language:$lang")
+    }
+  }
+  if ($mapArgs.Count -gt 0) { return ($mapArgs -join ' ') }
 
   if ($audioCount -eq 0) { return "-map 0:a?" }
   return "-map 0:a"
 }
 
+function Test-UndesiredDefaultStream {
+  param([object]$Stream)
+
+  if ($null -eq $Stream) { return $true }
+
+  $disp = $Stream.disposition
+  if ($disp) {
+    if (([int]($disp.comment -as [int])) -eq 1) { return $true }
+    if (([int]($disp.hearing_impaired -as [int])) -eq 1) { return $true }
+    if (([int]($disp.visual_impaired -as [int])) -eq 1) { return $true }
+  }
+
+  $tags = $Stream.tags
+  if ($tags) {
+    $tagText = @(
+      [string]$tags.title,
+      [string]$tags.comment,
+      [string]$tags.handler_name
+    ) -join ' '
+
+    if ($tagText -match '(?i)commentary|director\'?s\s+commentary|audio\s+description|descriptive\s+audio|description\s+track|hearing\s*impaired|\bsd?h\b') {
+      return $true
+    }
+  }
+
+  return $false
+}
+
+function Get-LanguageMapPlan {
+  param(
+    [string[]]$LangValues,
+    [object[]]$Streams,
+    [ValidateSet('a', 's')][string]$TypeToken
+  )
+
+  $normalized = @($LangValues | ForEach-Object {
+      if ($null -eq $_) { return }
+      foreach ($part in ("$_" -split ',')) {
+        $token = $part.Trim().ToLowerInvariant()
+        if (-not [string]::IsNullOrWhiteSpace($token)) { $token }
+      }
+    } | Select-Object -Unique)
+  if ($normalized.Count -eq 0) { $normalized = @('eng') }
+
+  $streamCount = @($Streams).Count
+  if ($normalized -contains 'nomap' -or $normalized -contains 'none') {
+    return [PSCustomObject]@{ MapArg = ''; MappedStreams = @(); Normalized = $normalized }
+  }
+
+  if ($normalized -contains 'all') {
+    if ($streamCount -eq 0) {
+      return [PSCustomObject]@{ MapArg = "-map 0:${TypeToken}?"; MappedStreams = @(); Normalized = $normalized }
+    }
+    return [PSCustomObject]@{ MapArg = "-map 0:${TypeToken}"; MappedStreams = @($Streams); Normalized = $normalized }
+  }
+
+  $mapArgs = New-Object System.Collections.Generic.List[string]
+  $mappedStreams = New-Object System.Collections.Generic.List[object]
+  foreach ($lang in $normalized) {
+    $matching = @($Streams | Where-Object { $_.tags -and $_.tags.language -ieq $lang })
+    if ($matching.Count -gt 0) {
+      [void]$mapArgs.Add("-map 0:${TypeToken}:m:language:$lang")
+      foreach ($m in $matching) { [void]$mappedStreams.Add($m) }
+    }
+  }
+
+  if ($mapArgs.Count -gt 0) {
+    return [PSCustomObject]@{ MapArg = ($mapArgs -join ' '); MappedStreams = @($mappedStreams); Normalized = $normalized }
+  }
+
+  if ($streamCount -eq 0) {
+    return [PSCustomObject]@{ MapArg = "-map 0:${TypeToken}?"; MappedStreams = @(); Normalized = $normalized }
+  }
+
+  return [PSCustomObject]@{ MapArg = "-map 0:${TypeToken}"; MappedStreams = @($Streams); Normalized = $normalized }
+}
+
+function Get-PreferredMappedDefaultIndex {
+  param([object[]]$MappedStreams)
+
+  if (-not $MappedStreams -or $MappedStreams.Count -eq 0) { return -1 }
+
+  for ($i = 0; $i -lt $MappedStreams.Count; $i++) {
+    if (-not (Test-UndesiredDefaultStream -Stream $MappedStreams[$i])) {
+      return $i
+    }
+  }
+
+  return 0
+}
+
 function Get-SubMapArg {
-  param([string]$SubLangValue, [object[]]$SubStreams)
+  param([string[]]$SubLangValue, [object[]]$SubStreams)
+
+  $langValues = @($SubLangValue | ForEach-Object {
+      if ($null -eq $_) { return }
+      foreach ($part in ("$_" -split ',')) {
+        $token = $part.Trim().ToLowerInvariant()
+        if (-not [string]::IsNullOrWhiteSpace($token)) { $token }
+      }
+    } | Select-Object -Unique)
+  if ($langValues.Count -eq 0) { $langValues = @('eng') }
 
   $subCount = @($SubStreams).Count
-  if ($SubLangValue -ieq "nomap" -or $SubLangValue -ieq "none") { return "" }
-  if ($SubLangValue -ieq "all") {
+  if ($langValues -contains "nomap" -or $langValues -contains "none") { return "" }
+  if ($langValues -contains "all") {
     if ($subCount -eq 0) { return "-map 0:s?" }
     return "-map 0:s"
   }
 
-  $matching = @($SubStreams | Where-Object { $_.tags -and $_.tags.language -ieq $SubLangValue })
-  if ($matching.Count -gt 0) { return "-map 0:s:m:language:$SubLangValue" }
+  $mapArgs = New-Object System.Collections.Generic.List[string]
+  foreach ($lang in $langValues) {
+    $matching = @($SubStreams | Where-Object { $_.tags -and $_.tags.language -ieq $lang })
+    if ($matching.Count -gt 0) {
+      [void]$mapArgs.Add("-map 0:s:m:language:$lang")
+    }
+  }
+  if ($mapArgs.Count -gt 0) { return ($mapArgs -join ' ') }
 
   if ($subCount -eq 0) { return "-map 0:s?" }
   return "-map 0:s"
@@ -883,13 +1030,29 @@ function Get-EncodeAnalysis {
   $subStreams = @($Probe.streams | Where-Object { $_.codec_type -ieq 'subtitle' })
   $primaryVideo = $videoStreams | Select-Object -First 1
 
-  $audioMap = Get-AudioMapArg -AudioLangValue $AudioLang -AudioStreams $audioStreams
-  $subMap = Get-SubMapArg -SubLangValue $SubLang -SubStreams $subStreams
+  $audioPlan = Get-LanguageMapPlan -LangValues $AudioLang -Streams $audioStreams -TypeToken 'a'
+  $subPlan = Get-LanguageMapPlan -LangValues $SubLang -Streams $subStreams -TypeToken 's'
+  $audioMap = $audioPlan.MapArg
+  $subMap = $subPlan.MapArg
+  $audioDisposition = ""
+  $subDisposition = ""
+  $preferredAudioIndex = Get-PreferredMappedDefaultIndex -MappedStreams $audioPlan.MappedStreams
+  if ($preferredAudioIndex -ge 0 -and -not [string]::IsNullOrWhiteSpace($audioMap)) {
+    # Ensure deterministic default: clear output audio dispositions, then set preferred mapped audio as default.
+    $audioDisposition = "-disposition:a 0 -disposition:a:$preferredAudioIndex default"
+  }
+  $preferredSubIndex = Get-PreferredMappedDefaultIndex -MappedStreams $subPlan.MappedStreams
+  if ($preferredSubIndex -ge 0 -and -not [string]::IsNullOrWhiteSpace($subMap)) {
+    # Ensure deterministic default: clear output subtitle dispositions, then set preferred mapped subtitle as default.
+    $subDisposition = "-disposition:s 0 -disposition:s:$preferredSubIndex default"
+  }
   $scaleArg = Get-ScaleArgumentFromProbe -ResizeValue $ResizeResolution -RetainAspectValue:$RetainAspect -ForceResizeValue:$ForceResize -ForceConvertValue:$ForceConvert -CanScaleUpValue:$CanScaleUp -CanScaleDownValue:$CanScaleDown -PrimaryVideoStream $primaryVideo
 
   return [PSCustomObject]@{
     AudioMap     = $audioMap
     SubMap       = $subMap
+    AudioDisp    = $audioDisposition
+    SubDisp      = $subDisposition
     ScaleArg     = $scaleArg
     PrimaryVideo = $primaryVideo
   }
@@ -1195,6 +1358,362 @@ function ConvertTo-BaseNameCodecTag {
   return $BaseName
 }
 
+function Test-AnalyzeCancellationRequested {
+  [OutputType([bool])]
+  param()
+
+  return ($script:StopRequested -or $script:CancellationToken.IsCancellationRequested)
+}
+
+function Register-AnalyzeTempArtifact {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  if ([string]::IsNullOrWhiteSpace($Path)) { return }
+  if (-not $script:AnalyzeTempArtifacts.Contains($Path)) {
+    [void]$script:AnalyzeTempArtifacts.Add($Path)
+  }
+}
+
+function Unregister-AnalyzeTempArtifact {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  if ([string]::IsNullOrWhiteSpace($Path)) { return }
+  [void]$script:AnalyzeTempArtifacts.Remove($Path)
+}
+
+function Remove-AnalyzeTempArtifacts {
+  param([Parameter(Mandatory = $false)][string]$OutputDir)
+
+  if (-not [string]::IsNullOrWhiteSpace($OutputDir) -and (Test-Path -LiteralPath $OutputDir -PathType Container -ErrorAction SilentlyContinue)) {
+    foreach ($stale in @(Get-ChildItem -LiteralPath $OutputDir -File -Filter 'metadata*.tmp*' -ErrorAction SilentlyContinue)) {
+      try { Remove-Item -LiteralPath $stale.FullName -Force -ErrorAction Stop }
+      catch { Write-VerboseParallelLog -Message "Unable to remove stale analyze artifact '$($stale.FullName)': $($_.Exception.Message)" }
+    }
+
+    foreach ($staleInProgress in @(Get-ChildItem -LiteralPath $OutputDir -File -Filter 'metadata*.inprogress*' -ErrorAction SilentlyContinue)) {
+      try { Remove-Item -LiteralPath $staleInProgress.FullName -Force -ErrorAction Stop }
+      catch { Write-VerboseParallelLog -Message "Unable to remove stale analyze in-progress artifact '$($staleInProgress.FullName)': $($_.Exception.Message)" }
+    }
+  }
+
+  foreach ($artifactPath in @($script:AnalyzeTempArtifacts)) {
+    if ([string]::IsNullOrWhiteSpace($artifactPath)) { continue }
+    try {
+      if (Test-Path -LiteralPath $artifactPath -PathType Leaf -ErrorAction SilentlyContinue) {
+        Remove-Item -LiteralPath $artifactPath -Force -ErrorAction Stop
+      }
+    }
+    catch {
+      Write-VerboseParallelLog -Message "Unable to remove analyze temp artifact '$artifactPath': $($_.Exception.Message)"
+    }
+    finally {
+      [void]$script:AnalyzeTempArtifacts.Remove($artifactPath)
+    }
+  }
+}
+
+function Get-FileMetadata {
+  [OutputType([hashtable])]
+  param(
+    [Parameter(Mandatory = $true)][string]$FilePath,
+    [Parameter(Mandatory = $false)][string]$HashAlgorithm = 'md5'
+  )
+
+  $metadata = @{
+    path = $FilePath
+    size = $null
+    mtime = $null
+    ctime = $null
+    hash = $null
+    duration = $null
+    video = $null
+    audio = @()
+    subtitles = @()
+    tags = @()
+  }
+
+  try {
+    $fileInfo = Get-Item -LiteralPath $FilePath -ErrorAction Stop
+    $metadata.size = $fileInfo.Length
+    $metadata.mtime = $fileInfo.LastWriteTimeUtc.ToString('o')
+    $metadata.ctime = $fileInfo.CreationTimeUtc.ToString('o')
+  } catch {
+    Write-ParallelLog -Message "Failed to get file system metadata for '$FilePath': $($_.Exception.Message)" -Level Error
+    return $null
+  }
+
+  try {
+    if ($HashAlgorithm -eq 'size-mtime') {
+      $metadata.hash = "size-mtime:$($metadata.size):$($fileInfo.LastWriteTimeUtc.Ticks)"
+    }
+    else {
+      $hashAlgo = switch ($HashAlgorithm) {
+        'md5' { [System.Security.Cryptography.MD5]::Create() }
+        'sha256' { [System.Security.Cryptography.SHA256]::Create() }
+      }
+      $stream = [System.IO.File]::OpenRead($FilePath)
+      try {
+        $hashBytes = $hashAlgo.ComputeHash($stream)
+        $metadata.hash = [BitConverter]::ToString($hashBytes).Replace('-', '').ToLower()
+      } finally {
+        $stream.Dispose()
+      }
+      $hashAlgo.Dispose()
+    }
+  } catch {
+    Write-ParallelLog -Message "Failed to compute hash for '$FilePath': $($_.Exception.Message)" -Level Error
+    return $null
+  }
+
+  # Only run ffprobe on file types it can meaningfully parse (video + audio containers).
+  # Images, ebooks, subtitles and other companion files get filesystem-only metadata.
+  $ffprobeCapableExts = @(
+    '.avi','.divx','.mkv','.mp4','.m4v','.m2ts','.mts','.mov','.mpg','.mpeg',
+    '.ts','.wmv','.flv','.webm','.3gp','.3g2','.vob','.f4v','.ogv','.rm','.rmvb','.asf',
+    '.mp3','.flac','.aac','.m4a','.ogg','.opus','.wav','.wma','.aiff','.aif',
+    '.alac','.ape','.wv','.mka','.dts','.ac3','.eac3','.dsf','.dff'
+  )
+  $fileExt = [System.IO.Path]::GetExtension($FilePath).ToLowerInvariant()
+
+  if ($ffprobeCapableExts -contains $fileExt) {
+    try {
+      $probe = Get-FFprobeJson -InputPath $FilePath -AnalyzeMode
+      if ($probe) {
+        $metadata.duration = [math]::Round(($probe.format.duration -as [double]) * 1000)  # in milliseconds
+        if ($probe.format.tags) {
+          $metadata.tags = $probe.format.tags.PSObject.Properties | ForEach-Object { "$($_.Name):$($_.Value)" }
+        }
+        if ($probe.streams) {
+          $videoStream = $probe.streams | Where-Object { $_.codec_type -eq 'video' } | Select-Object -First 1
+          if ($videoStream) {
+            $metadata.video = @{
+              codec    = $videoStream.codec_name
+              bitrate  = [int]$videoStream.bit_rate
+              width    = [int]$videoStream.width
+              height   = [int]$videoStream.height
+              hdr      = ($videoStream.color_space -eq 'bt2020nc' -or $videoStream.color_transfer -eq 'smpte2084')
+            }
+          }
+          $audioStreams = $probe.streams | Where-Object { $_.codec_type -eq 'audio' }
+          $metadata.audio = $audioStreams | ForEach-Object {
+            @{
+              lang     = $_.tags.language
+              codec    = $_.codec_name
+              channels = [int]$_.channels
+            }
+          }
+          $subtitleStreams = $probe.streams | Where-Object { $_.codec_type -eq 'subtitle' }
+          $metadata.subtitles = $subtitleStreams | ForEach-Object { $_.tags.language } | Where-Object { $_ } | Sort-Object -Unique
+        }
+      }
+    } catch {
+      Write-ParallelLog -Message "Failed to probe '$FilePath': $($_.Exception.Message)" -Level Error
+      return $null
+    }
+  }
+
+  return $metadata
+}
+
+function Export-MetadataToNDJSON {
+  param(
+    [Parameter(Mandatory = $true)][array]$MetadataList,
+    [Parameter(Mandatory = $true)][string]$OutputDir,
+    [Parameter(Mandatory = $false)][switch]$GenerateHtml
+  )
+
+  $ndjsonPath = Join-Path $OutputDir "metadata.ndjson"
+  $htmlPath = Join-Path $OutputDir "metadata_report.html"
+
+  function Get-ImpliedLibraryName {
+    param(
+      [Parameter(Mandatory = $false)][string]$PathValue
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PathValue)) { return "(root)" }
+
+    $parts = $PathValue -split '[\\/]+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    if ($parts.Count -eq 0) { return "(root)" }
+
+    $mediaIdx = -1
+    for ($i = 0; $i -lt $parts.Count; $i++) {
+      if ($parts[$i].ToLowerInvariant() -eq 'media') { $mediaIdx = $i; break }
+    }
+
+    if ($mediaIdx -ge 0 -and ($mediaIdx + 1) -lt $parts.Count) {
+      return $parts[$mediaIdx + 1]
+    }
+
+    if ($parts.Count -gt 1 -and $parts[0] -match '^[A-Za-z]:$') {
+      return $parts[1]
+    }
+
+    return $parts[0]
+  }
+
+  # Append new metadata to NDJSON
+  $tempNdjson = "$ndjsonPath.$([guid]::NewGuid().ToString('N')).tmp"
+  Register-AnalyzeTempArtifact -Path $tempNdjson
+  $stream = $null
+  $writer = $null
+  try {
+    if (Test-AnalyzeCancellationRequested) {
+      Write-ParallelLog -Message "Analyze cancellation requested before NDJSON write; skipping export." -Level Warning -Target Both
+      return
+    }
+
+    $stream = [System.IO.File]::Open($tempNdjson, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    $writer = [System.IO.StreamWriter]::new($stream, [System.Text.Encoding]::UTF8)
+    foreach ($meta in $MetadataList) {
+      if (Test-AnalyzeCancellationRequested) {
+        Write-ParallelLog -Message "Analyze cancellation requested during NDJSON write; dropping temp artifact." -Level Warning -Target Both
+        return
+      }
+
+      if ($meta) {
+        $metaForExport = $meta
+        $existingLibraryProp = $meta.PSObject.Properties['library']
+        if (-not $existingLibraryProp -or [string]::IsNullOrWhiteSpace([string]$existingLibraryProp.Value)) {
+          $libraryName = Get-ImpliedLibraryName -PathValue ([string]$meta.path)
+          $metaForExport = [PSCustomObject]@{}
+          foreach ($prop in $meta.PSObject.Properties) {
+            $metaForExport | Add-Member -NotePropertyName $prop.Name -NotePropertyValue $prop.Value
+          }
+          $metaForExport | Add-Member -NotePropertyName 'library' -NotePropertyValue $libraryName
+        }
+
+        $json = $metaForExport | ConvertTo-Json -Compress -Depth 10
+        $writer.WriteLine($json)
+      }
+    }
+    $writer.Flush()
+    $writer.Dispose()
+    $writer = $null
+    $stream.Dispose()
+    $stream = $null
+
+    if (Test-AnalyzeCancellationRequested) {
+      Write-ParallelLog -Message "Analyze cancellation requested before NDJSON finalize; dropping temp artifact." -Level Warning -Target Both
+      return
+    }
+
+    # Atomic replace
+    [System.IO.File]::Move($tempNdjson, $ndjsonPath, $true)
+    Unregister-AnalyzeTempArtifact -Path $tempNdjson
+  } catch {
+    Write-ParallelLog -Message "Failed to write NDJSON: $($_.Exception.Message)" -Level Error
+    if ($writer) { try { $writer.Dispose() } catch { } }
+    if ($stream) { try { $stream.Dispose() } catch { } }
+    if (Test-Path -LiteralPath $tempNdjson -PathType Leaf -ErrorAction SilentlyContinue) { Remove-Item -LiteralPath $tempNdjson -Force -ErrorAction SilentlyContinue }
+    Unregister-AnalyzeTempArtifact -Path $tempNdjson
+    return
+  }
+
+  # Generate HTML if requested
+  if ($GenerateHtml) {
+    try {
+      $generatedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+      $templatePath = Join-Path $PSScriptRoot 'metadata_report_template.html'
+      if (-not (Test-Path -LiteralPath $templatePath -PathType Leaf -ErrorAction SilentlyContinue)) {
+        throw "HTML template not found at: $templatePath"
+      }
+      $entryCount = $MetadataList.Count.ToString('N0')
+      $html = (Get-Content -LiteralPath $templatePath -Raw -Encoding UTF8).Replace(
+        '<!-- REPORT_META -->',
+        "Generated: $generatedAt &bull; $entryCount entries"
+      )
+      $html | Out-File -LiteralPath $htmlPath -Encoding UTF8
+    } catch {
+      Write-ParallelLog -Message "Failed to generate HTML: $($_.Exception.Message)" -Level Error
+    }
+  }
+}
+
+function Invoke-CompactMetadata {
+  param(
+    [Parameter(Mandatory = $true)][string]$OutputDir
+  )
+
+  $ndjsonPath = Join-Path $OutputDir "metadata.ndjson"
+  if (Test-AnalyzeCancellationRequested) {
+    Write-ParallelLog -Message "Analyze cancellation requested before compaction; skipping compaction." -Level Warning -Target Both
+    return
+  }
+
+  if (-not (Test-Path $ndjsonPath)) {
+    Write-ParallelLog -Message "No NDJSON file found for compaction" -Level Warning
+    return
+  }
+
+  # Read all entries
+  $entries = @()
+  try {
+    $lines = Get-Content $ndjsonPath -Encoding UTF8
+    foreach ($line in $lines) {
+      if ($line.Trim()) {
+        $entries += $line | ConvertFrom-Json
+      }
+    }
+  } catch {
+    Write-ParallelLog -Message "Failed to read NDJSON for compaction: $($_.Exception.Message)" -Level Error
+    return
+  }
+
+  # Group by path, keep latest (assuming append order)
+  $latestEntries = @{}
+  foreach ($entry in $entries) {
+    $latestEntries[$entry.path] = $entry
+  }
+
+  # Filter out deleted files
+  $currentEntries = $latestEntries.Values | Where-Object {
+    Test-Path -LiteralPath $_.path -ErrorAction SilentlyContinue
+  }
+
+  # Rewrite NDJSON
+  $tempNdjson = "$ndjsonPath.$([guid]::NewGuid().ToString('N')).tmp"
+  Register-AnalyzeTempArtifact -Path $tempNdjson
+  try {
+    if (Test-AnalyzeCancellationRequested) {
+      Write-ParallelLog -Message "Analyze cancellation requested during compaction setup; dropping temp artifact." -Level Warning -Target Both
+      return
+    }
+
+    $stream = [System.IO.File]::Open($tempNdjson, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    $writer = [System.IO.StreamWriter]::new($stream, [System.Text.Encoding]::UTF8)
+    foreach ($entry in $currentEntries) {
+      if (Test-AnalyzeCancellationRequested) {
+        Write-ParallelLog -Message "Analyze cancellation requested during compaction write; dropping temp artifact." -Level Warning -Target Both
+        $writer.Dispose()
+        $stream.Dispose()
+        return
+      }
+
+      $json = $entry | ConvertTo-Json -Compress -Depth 10
+      $writer.WriteLine($json)
+    }
+    $writer.Flush()
+    $writer.Dispose()
+    $stream.Dispose()
+
+    if (Test-AnalyzeCancellationRequested) {
+      Write-ParallelLog -Message "Analyze cancellation requested before compacted NDJSON finalize; dropping temp artifact." -Level Warning -Target Both
+      return
+    }
+
+    # Atomic replace
+    [System.IO.File]::Move($tempNdjson, $ndjsonPath, $true)
+    Unregister-AnalyzeTempArtifact -Path $tempNdjson
+  } catch {
+    Write-ParallelLog -Message "Failed to compact NDJSON: $($_.Exception.Message)" -Level Error
+    if (Test-Path -LiteralPath $tempNdjson -PathType Leaf -ErrorAction SilentlyContinue) { Remove-Item -LiteralPath $tempNdjson -Force -ErrorAction SilentlyContinue }
+    Unregister-AnalyzeTempArtifact -Path $tempNdjson
+    return
+  }
+
+  Write-ParallelLog -Message "Compacted metadata: $($currentEntries.Count) current entries"
+}
+
 function Get-OutputPath {
   param(
     [System.IO.FileInfo]$FileInfo,
@@ -1284,7 +1803,12 @@ function Get-ArchiveDirectory {
 }
 
 function Get-InputItemList {
-  param([string]$InputPath)
+  param(
+    [string]$InputPath,
+    # When set, includes all known video formats (for audit/analyze mode).
+    # When not set, only includes the narrower encoding-candidate subset.
+    [switch]$AllMedia
+  )
 
   $pathForScan = $InputPath
   $pathExistsLiteral = Test-Path -LiteralPath $pathForScan -ErrorAction SilentlyContinue
@@ -1304,10 +1828,32 @@ function Get-InputItemList {
   $reprocessFilter = { $_.Name -notmatch "- proc" }
   if ($CanReprocess) { $reprocessFilter = { $true } }
 
+  $extensionFilter = if ($AllMedia) {
+    # All known media file types. The library (derived from directory) identifies what it actually is.
+    $allMediaExts = @(
+      # Video
+      '.avi','.divx','.mkv','.mp4','.m4v','.m2ts','.mts','.mov','.mpg','.mpeg',
+      '.ts','.wmv','.flv','.webm','.3gp','.3g2','.vob','.f4v','.ogv','.rm','.rmvb','.asf',
+      # Audio
+      '.mp3','.flac','.aac','.m4a','.ogg','.opus','.wav','.wma','.aiff','.aif',
+      '.alac','.ape','.wv','.mka','.dts','.ac3','.eac3','.dsf','.dff',
+      # Images
+      '.jpg','.jpeg','.png','.gif','.bmp','.tiff','.tif','.webp','.heic','.heif',
+      '.raw','.cr2','.cr3','.nef','.arw','.dng','.orf','.rw2','.pef',
+      # Ebooks / documents
+      '.epub','.mobi','.azw','.azw3','.pdf','.cbz','.cbr','.cb7','.djvu',
+      # Subtitles / companion
+      '.srt','.ass','.ssa','.sub','.idx','.vtt','.sup'
+    )
+    { $allMediaExts -contains $_.Extension.ToLowerInvariant() }.GetNewClosure()
+  } else {
+    { $_.Extension -match '^\.(avi|divx|m.*|ts|wmv)' }
+  }
+
   return @(
     $items |
     Sort-Object $SortExpression |
-    Where-Object { $_.Extension -match '^\.(avi|divx|m.*|ts|wmv)' } |
+    Where-Object -FilterScript $extensionFilter |
     Where-Object -FilterScript $reprocessFilter |
     Where-Object -FilterScript $UserFilter |
     Where-Object {
@@ -1413,9 +1959,11 @@ function Start-EncodeProcess {
   $analysis = $JobState.Analysis
   $audioMap = $analysis.AudioMap
   $subMap = $analysis.SubMap
+  $audioDisp = $analysis.AudioDisp
+  $subDisp = $analysis.SubDisp
   $scaleArg = $analysis.ScaleArg
 
-  Write-VerboseParallelLog -Message "Job analysis selected. AudioMap='$audioMap' SubMap='$subMap' ScaleArg='$scaleArg'" -JobId $JobId
+  Write-VerboseParallelLog -Message "Job analysis selected. AudioMap='$audioMap' SubMap='$subMap' AudioDisp='$audioDisp' SubDisp='$subDisp' ScaleArg='$scaleArg'" -JobId $JobId
 
   $bitrateArg = ""
   if (-not [string]::IsNullOrWhiteSpace($BitrateControl)) { $bitrateArg = "-b:v $BitrateControl " }
@@ -1433,7 +1981,7 @@ function Start-EncodeProcess {
 
   $ffmpegArgs = "-hide_banner -y -threads 0 ${hwaccelArgs}-copy_unknown -analyzeduration 4GB -probesize 4GB "
   $ffmpegArgs += "-nostats -stats_period 0.25 -progress `"$progressTarget`" -i `"$($item.FullName)`" "
-  $ffmpegArgs += "$scaleArg -default_mode infer_no_subs -map 0:v:0 $audioMap $subMap -dn -map_metadata 0 -map_chapters 0 "
+  $ffmpegArgs += "$scaleArg -default_mode infer_no_subs -map 0:v:0 $audioMap $subMap $audioDisp $subDisp -dn -map_metadata 0 -map_chapters 0 "
   $ffmpegArgs += "-c:v $($hwProfile.Encoder) -c:a copy -c:s copy "
   $ffmpegArgs += $codecArgs
   $ffmpegArgs += "-max_interleave_delta 500000 "
@@ -2123,7 +2671,6 @@ $candidates = $null
 $canceledPendingCount = 0
 $runStarted = Get-Date
 Register-CancellationHandler
-$script:HWProfile = Get-HardwareEncoderProfile -PreferredEncoder $Encoder
 
 # Clean up old log files (main logs and progress dumps).
 $logFilter = Join-Path $script:log_path "${script:LogPrefix}_*.log"
@@ -2135,17 +2682,16 @@ if ($oldLogs.Count -gt 0) {
   Write-ParallelLog -Message "Cleaning up $($oldLogs.Count) old log file(s)..." -Target Both
   $removedCount = 0
   foreach ($log in $oldLogs) {
-    $logSplit = ($log.BaseName -split "_")
-    if ($logSplit.Count -ge 4) {
-      $today = (Get-Date).Date
-      $dateStr = ($logSplit[3] -replace '[^0-9]', '')
-      if ($dateStr.Length -ge 8) {
-        $logday = [DateTime]::ParseExact($dateStr.Substring(0, 8), "yyyyMMdd", $null)
-        if (($logday -lt $today.AddDays(-1)) -or ($log.Length -lt 2KB)) {
-          Remove-Item -LiteralPath $log.FullName -Force -ErrorAction SilentlyContinue
-          $removedCount++
-        }
-      }
+    # Use file timestamps instead of name parsing so cleanup works regardless of
+    # script prefix shape (for example names that already contain underscores).
+    $isOld = $log.CreationTime -lt (Get-Date).AddDays(-1)
+    if (-not $isOld) {
+      $isOld = $log.LastWriteTime -lt (Get-Date).AddDays(-1)
+    }
+
+    if ($isOld -or ($log.Length -lt 2KB)) {
+      Remove-Item -LiteralPath $log.FullName -Force -ErrorAction SilentlyContinue
+      $removedCount++
     }
   }
   if ($removedCount -gt 0) {
@@ -2153,7 +2699,145 @@ if ($oldLogs.Count -gt 0) {
   }
 }
 
+# Handle -Analyze and -Compact modes
+if ($Analyze -or $Compact) {
+  # Keep analysis artifacts with encode logs so all run outputs are in one place.
+  $outputDir = $script:log_path
+  $inProgressNdjsonPath = Join-Path $outputDir 'metadata.ndjson.inprogress'
+  if (-not (Test-Path $outputDir)) {
+    Write-ParallelLog -Message "Output directory does not exist: $outputDir" -Level Error
+    exit 1
+  }
+
+  Write-ParallelLog -Message "Analysis artifacts directory: '$outputDir'" -Target Both
+
+  Remove-AnalyzeTempArtifacts -OutputDir $outputDir
+
+  # Mutex for parallel runs
+  $mutex = $null
+  try {
+    $mutex = [System.Threading.Mutex]::new($false, "Global\ffmpeg_h265_analyze_$([System.IO.Path]::GetFileName($outputDir))")
+    if (-not $mutex.WaitOne(0)) {
+      Write-ParallelLog -Message "Another -Analyze run is already in progress for this directory" -Level Error
+      exit 1
+    }
+  } catch {
+    Write-ParallelLog -Message "Failed to acquire mutex: $($_.Exception.Message)" -Level Error
+    exit 1
+  }
+
+  try {
+    if ($Compact) {
+      $configText = ($script:RunConfig.GetEnumerator() | ForEach-Object { "{0}='{1}'" -f $_.Key, $_.Value }) -join "; "
+      Write-ParallelLog -Message "Start compaction run. $configText" -Target Log
+      Write-ParallelLog -Message "Starting compaction mode" -Target Both
+      Invoke-CompactMetadata -OutputDir $outputDir
+      if (Test-Path -LiteralPath $inProgressNdjsonPath -PathType Leaf -ErrorAction SilentlyContinue) {
+        Remove-Item -LiteralPath $inProgressNdjsonPath -Force -ErrorAction SilentlyContinue
+      }
+      Unregister-AnalyzeTempArtifact -Path $inProgressNdjsonPath
+      Remove-AnalyzeTempArtifacts -OutputDir $outputDir
+      Write-ParallelLog -Message "Compaction completed" -Target Both
+      exit 0
+    }
+
+    # Analyze mode
+    $configText = ($script:RunConfig.GetEnumerator() | ForEach-Object { "{0}='{1}'" -f $_.Key, $_.Value }) -join "; "
+    Write-ParallelLog -Message "Start analysis run. $configText" -Target Log
+    Write-ParallelLog -Message "Analyze hash strategy: '$HashAlgorithm'." -Target Both
+    Write-ParallelLog -Message "Starting analysis mode" -Target Both
+    $items = Get-InputItemList -InputPath $Path -AllMedia
+    if (-not $items -or $items.Count -eq 0) {
+      Write-ParallelLog -Message "No matching files found for analysis" -Target Both
+      exit 0
+    }
+
+    Write-ParallelLog -Message "Discovered $($items.Count) file(s) for analysis" -Target Both
+
+    $metadataList = @()
+    Register-AnalyzeTempArtifact -Path $inProgressNdjsonPath
+    if (Test-Path -LiteralPath $inProgressNdjsonPath -PathType Leaf -ErrorAction SilentlyContinue) {
+      Remove-Item -LiteralPath $inProgressNdjsonPath -Force -ErrorAction SilentlyContinue
+    }
+
+    $analysisStartedAt = Get-Date
+    $analysisWorkMs = 0.0
+    $processed = 0
+    foreach ($item in $items) {
+      if (Test-AnalyzeCancellationRequested) {
+        Write-ParallelLog -Message "Analyze cancellation requested. Stopping scan before writing outputs." -Level Warning -Target Both
+        break
+      }
+
+      $processed++
+      Write-Progress -Activity "Analyzing files" -Status "$processed/$($items.Count): $($item.Name)" -PercentComplete (($processed / $items.Count) * 100)
+
+      $itemStartedAt = Get-Date
+      $meta = Get-FileMetadata -FilePath $item.FullName -HashAlgorithm $HashAlgorithm
+      $itemElapsedMs = ((Get-Date) - $itemStartedAt).TotalMilliseconds
+      $analysisWorkMs += $itemElapsedMs
+      if ($meta) {
+        $metadataList += $meta
+
+        try {
+          $line = $meta | ConvertTo-Json -Compress -Depth 10
+          [System.IO.File]::AppendAllText($inProgressNdjsonPath, $line + [Environment]::NewLine, [System.Text.Encoding]::UTF8)
+        }
+        catch {
+          Write-ParallelLog -Message "Failed to update analysis in-progress output '$inProgressNdjsonPath': $($_.Exception.Message)" -Level Warning -Target Both
+        }
+
+        Write-ParallelLog -Message "Analyzed [$processed/$($items.Count)] in $([Math]::Round(($itemElapsedMs / 1000.0), 3))s: $($item.FullName)" -Target Log
+      }
+    }
+
+    Write-Progress -Completed
+
+    if (Test-AnalyzeCancellationRequested) {
+      Remove-AnalyzeTempArtifacts -OutputDir $outputDir
+      Write-ParallelLog -Message "Analyze canceled. Temporary artifacts were cleaned up." -Level Warning -Target Both
+      exit 130
+    }
+
+    if ($metadataList.Count -gt 0) {
+      Export-MetadataToNDJSON -MetadataList $metadataList -OutputDir $outputDir -GenerateHtml
+      if (Test-AnalyzeCancellationRequested) {
+        Remove-AnalyzeTempArtifacts -OutputDir $outputDir
+        Write-ParallelLog -Message "Analyze canceled during output generation. Temporary artifacts were cleaned up." -Level Warning -Target Both
+        exit 130
+      }
+
+      Invoke-CompactMetadata -OutputDir $outputDir
+      Remove-AnalyzeTempArtifacts -OutputDir $outputDir
+
+      if (Test-AnalyzeCancellationRequested) {
+        Write-ParallelLog -Message "Analyze canceled during compaction. Temporary artifacts were cleaned up." -Level Warning -Target Both
+        exit 130
+      }
+
+      $analysisElapsed = (Get-Date) - $analysisStartedAt
+      $count = [Math]::Max(1, $metadataList.Count)
+      $avgSecondsPerFile = [Math]::Round((($analysisWorkMs / $count) / 1000.0), 3)
+      $filesPerMinute = [Math]::Round(($metadataList.Count / [Math]::Max(0.001, $analysisElapsed.TotalMinutes)), 2)
+      Write-ParallelLog -Message "Analysis timing summary: total=$([Math]::Round($analysisElapsed.TotalMinutes, 2)) min; avg/file=$avgSecondsPerFile s; throughput=$filesPerMinute files/min; files=$($metadataList.Count)." -Target Both
+      Write-ParallelLog -Message "Analysis completed: processed $($metadataList.Count) files" -Target Both
+    } else {
+      Write-ParallelLog -Message "No valid metadata collected" -Target Both
+    }
+  } finally {
+    Remove-AnalyzeTempArtifacts -OutputDir $outputDir
+    if ($mutex) {
+      try { $mutex.ReleaseMutex() } catch { }
+      try { $mutex.Dispose() } catch { }
+    }
+  }
+
+  exit 0
+}
+
 try {
+  $script:HWProfile = Get-HardwareEncoderProfile -PreferredEncoder $Encoder
+
   $configText = ($script:RunConfig.GetEnumerator() | ForEach-Object { "{0}='{1}'" -f $_.Key, $_.Value }) -join "; "
   Write-ParallelLog -Message "Start encoding run. $configText" -Target Log
 
