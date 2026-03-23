@@ -173,6 +173,8 @@ else { "${script:LogPrefix}_log" }
 $script:LogMutex = $null
 $script:ArrRefreshJobs = [System.Collections.Generic.List[object]]::new()
 $script:ArrRefreshJobMeta = @{}
+$script:ArrRefreshRequestedKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$script:ArrRefreshTargets = @{}
 
 # Configuration values are required, resolved as env var first, then config file.
 # Precedence for environment/deployment settings is:
@@ -919,7 +921,7 @@ function Test-UndesiredDefaultStream {
       [string]$tags.handler_name
     ) -join ' '
 
-    if ($tagText -match '(?i)commentary|director\'?s\s+commentary|audio\s+description|descriptive\s+audio|description\s+track|hearing\s*impaired|\bsd?h\b') {
+    if ($tagText -match '(?i)commentary|director''?s\s+commentary|audio\s+description|descriptive\s+audio|description\s+track|hearing\s*impaired|\bsd?h\b') {
       return $true
     }
   }
@@ -966,7 +968,7 @@ function Get-LanguageMapPlan {
   }
 
   if ($mapArgs.Count -gt 0) {
-    return [PSCustomObject]@{ MapArg = ($mapArgs -join ' '); MappedStreams = @($mappedStreams); Normalized = $normalized }
+    return [PSCustomObject]@{ MapArg = ($mapArgs -join ' '); MappedStreams = $mappedStreams.ToArray(); Normalized = $normalized }
   }
 
   if ($streamCount -eq 0) {
@@ -1896,6 +1898,17 @@ function Invoke-ArrRefresh {
 
   if ([string]::IsNullOrWhiteSpace($TitleName)) { return }
 
+  $typeName = [ArrType].GetEnumName($Type)
+  $normalizedTitle = $TitleName.Trim()
+  $normalizedBaseUri = if ([string]::IsNullOrWhiteSpace($BaseUri)) { '' }
+  else { $BaseUri.Trim().TrimEnd('/') }
+  $refreshKey = "{0}|{1}|{2}" -f $typeName, $normalizedBaseUri, $normalizedTitle
+
+  if (-not $script:ArrRefreshRequestedKeys.Add($refreshKey)) {
+    Write-VerboseParallelLog -Message "Skipping duplicate Arr refresh request (type='$typeName', title='$normalizedTitle')." -JobId $JobId
+    return
+  }
+
   # Fire-and-forget: run the lookup + refresh in a background thread so it doesn't
   # block the main loop's progress rendering.
   $scriptBlock = {
@@ -1921,7 +1934,6 @@ function Invoke-ArrRefresh {
   }
 
   try {
-    $typeName = [ArrType].GetEnumName($Type)
     $job = Start-ThreadJob -ScriptBlock $scriptBlock -ArgumentList $typeName, $TitleName, $BaseUri, $ApiKey
     [void]$script:ArrRefreshJobs.Add($job)
     $script:ArrRefreshJobMeta[$job.Id] = [PSCustomObject]@{
@@ -1932,7 +1944,51 @@ function Invoke-ArrRefresh {
     Write-ParallelLog -Message "Arr refresh requested." -Target Both -JobId $JobId
   }
   catch {
+    [void]$script:ArrRefreshRequestedKeys.Remove($refreshKey)
     Write-ParallelLog -Message "Arr refresh request failed: $($_.Exception.Message)" -Level Warning -Target Both -JobId $JobId
+  }
+}
+
+function Queue-ArrRefreshTarget {
+  param(
+    [ArrType]$Type,
+    [string]$TitleName,
+    [string]$BaseUri,
+    [string]$ApiKey,
+    [int]$JobId
+  )
+
+  if ([string]::IsNullOrWhiteSpace($TitleName)) { return }
+
+  $typeName = [ArrType].GetEnumName($Type)
+  $normalizedTitle = $TitleName.Trim()
+  $normalizedBaseUri = if ([string]::IsNullOrWhiteSpace($BaseUri)) { '' }
+  else { $BaseUri.Trim().TrimEnd('/') }
+  $refreshKey = "{0}|{1}|{2}" -f $typeName, $normalizedBaseUri, $normalizedTitle
+
+  if ($script:ArrRefreshTargets.ContainsKey($refreshKey)) {
+    Write-VerboseParallelLog -Message "Skipping duplicate queued Arr refresh target (type='$typeName', title='$normalizedTitle')." -JobId $JobId
+    return
+  }
+
+  $script:ArrRefreshTargets[$refreshKey] = [PSCustomObject]@{
+    Type      = $Type
+    TitleName = $normalizedTitle
+    BaseUri   = $BaseUri
+    ApiKey    = $ApiKey
+    JobId     = $JobId
+  }
+}
+
+function Invoke-QueuedArrRefreshes {
+  param()
+
+  if (-not $RefreshArrOnCompletion) { return }
+  if (-not $script:ArrRefreshTargets -or $script:ArrRefreshTargets.Count -eq 0) { return }
+
+  Write-ParallelLog -Message "Dispatching end-of-run Arr refresh requests for $($script:ArrRefreshTargets.Count) deduped title(s)." -Target Both
+  foreach ($target in @($script:ArrRefreshTargets.Values)) {
+    Invoke-ArrRefresh -Type $target.Type -TitleName $target.TitleName -BaseUri $target.BaseUri -ApiKey $target.ApiKey -JobId $target.JobId
   }
 }
 
@@ -2342,7 +2398,7 @@ function Complete-JobFinalization {
         }
         else {
           $titleName = (($arr.Type -eq [ArrType]::series -or $srcFile.Directory.Name.ToLower().StartsWith("season")) ? $srcFile.Directory.Parent.Name : $srcFile.Directory.Name)
-          Invoke-ArrRefresh -Type $arr.Type -TitleName $titleName -BaseUri $arr.BaseUri -ApiKey $arr.ApiKey -JobId $JobId
+          Queue-ArrRefreshTarget -Type $arr.Type -TitleName $titleName -BaseUri $arr.BaseUri -ApiKey $arr.ApiKey -JobId $JobId
         }
       }
 
@@ -2372,7 +2428,7 @@ function Complete-JobFinalization {
       }
       else {
         $titleName = (($arr.Type -eq [ArrType]::series -or $srcFile.Directory.Name.ToLower().StartsWith("season")) ? $srcFile.Directory.Parent.Name : $srcFile.Directory.Name)
-        Invoke-ArrRefresh -Type $arr.Type -TitleName $titleName -BaseUri $arr.BaseUri -ApiKey $arr.ApiKey -JobId $JobId
+        Queue-ArrRefreshTarget -Type $arr.Type -TitleName $titleName -BaseUri $arr.BaseUri -ApiKey $arr.ApiKey -JobId $JobId
       }
     }
 
@@ -2962,6 +3018,8 @@ try {
     }
   }
 
+  Invoke-QueuedArrRefreshes
+
   if ($script:CanRenderProgress) {
     Write-Progress -Id 0 -Activity "ffmpeg workload" -Completed
     foreach ($k in @($sync.Keys)) {
@@ -3088,6 +3146,11 @@ finally {
     $arrJobs | Remove-Job -Force -ErrorAction SilentlyContinue
     $script:ArrRefreshJobs.Clear()
     $script:ArrRefreshJobMeta.Clear()
+    $script:ArrRefreshRequestedKeys.Clear()
+  }
+
+  if ($script:ArrRefreshTargets) {
+    $script:ArrRefreshTargets.Clear()
   }
 
   if ($script:LogMutex) {
