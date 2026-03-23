@@ -440,6 +440,11 @@ The script automatically determines whether to refresh Radarr (Movies) or Sonarr
 - Files under `media_path\<movies_subfolder>` trigger Radarr refresh
 - Files under `media_path\<tv_shows_subfolder>` trigger Sonarr refresh
 
+**Refresh Timing and Deduplication:**
+- Refresh targets are queued during file finalization and deduplicated by type + base URL + title
+- The script dispatches Arr refresh requests once at end-of-run (after all file finalization completes)
+- This avoids duplicate refresh calls for the same title during large batches while ensuring final library state is refreshed
+
 This allows processing of mixed content. For example, `-Path "V:\Media"` will process both Movies and TV Shows subdirectories, with each file refreshed in the appropriate system based on its actual location.
 
 After processing, the script triggers a refresh scan to update the media server database using the configured base URLs and API keys.

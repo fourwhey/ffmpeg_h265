@@ -1958,6 +1958,8 @@ function Queue-ArrRefreshTarget {
     [int]$JobId
   )
 
+  # Queue refresh targets during per-file finalization and dedupe by type/baseUri/title.
+  # Actual Arr API refresh requests are dispatched once at end-of-run.
   if ([string]::IsNullOrWhiteSpace($TitleName)) { return }
 
   $typeName = [ArrType].GetEnumName($Type)
@@ -1983,6 +1985,7 @@ function Queue-ArrRefreshTarget {
 function Invoke-QueuedArrRefreshes {
   param()
 
+  # End-of-run dispatch ensures refresh happens after all files have been finalized.
   if (-not $RefreshArrOnCompletion) { return }
   if (-not $script:ArrRefreshTargets -or $script:ArrRefreshTargets.Count -eq 0) { return }
 
