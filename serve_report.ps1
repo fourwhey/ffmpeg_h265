@@ -4,22 +4,29 @@
   Starts a local HTTP server and opens the metadata report in the browser.
 .DESCRIPTION
   Starts a System.Net.HttpListener on the specified port, serves files from this
-  script directory, and opens metadata_report.html from that served root in the
-  default browser.
+  script directory, and opens either metadata_report_sample.html or
+  metadata_report.html from that served root in the default browser.
 .NOTES
   - Base URL: http://localhost:<Port>/
-  - Default page: metadata_report.html
+  - Default page: metadata_report_sample.html
   - Press Ctrl+C to stop the server.
 #>
 param(
-  [int] $Port = 8080
+  [int] $Port = 8080,
+  [ValidateSet('sample', 'runtime')][string] $Report = 'sample'
 )
 
 $root = $PSScriptRoot
 if (-not $root) { $root = $PWD.Path }
 
+$defaultPage = if ($Report -eq 'sample' -and (Test-Path -LiteralPath (Join-Path $root 'metadata_report_sample.html') -PathType Leaf)) {
+  'metadata_report_sample.html'
+} else {
+  'metadata_report.html'
+}
+
 $baseUrl   = "http://localhost:$Port/"
-$reportUrl = "${baseUrl}metadata_report.html"
+$reportUrl = "${baseUrl}$defaultPage"
 
 $listener = [System.Net.HttpListener]::new()
 $listener.Prefixes.Add($baseUrl)
@@ -60,7 +67,7 @@ try {
     $resp = $ctx.Response
 
     $reqPath = $req.Url.LocalPath.TrimStart('/')
-    if ([string]::IsNullOrEmpty($reqPath)) { $reqPath = 'metadata_report.html' }
+    if ([string]::IsNullOrEmpty($reqPath)) { $reqPath = $defaultPage }
 
     # Resolve and guard against path traversal.
     $resolvedRoot = [System.IO.Path]::GetFullPath($root)

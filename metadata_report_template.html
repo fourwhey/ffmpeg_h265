@@ -32,7 +32,7 @@
   </style>
 </head>
 <body>
-<div class="wrap"><div class="topbar"><div class="title">MEDIA<span>AUDIT</span></div><div style="display:flex;align-items:center;gap:10px"><button id="themeToggle" class="toolbar-btn" type="button">Theme: Dark</button><div class="meta"><!-- REPORT_META --></div></div></div>
+<div class="wrap"><div class="topbar"><div class="title">MEDIA<span>AUDIT</span></div><div style="display:flex;align-items:center;gap:10px"><button id="themeToggle" class="toolbar-btn" type="button">Theme: Dark</button><div class="meta" id="reportMeta"><!-- REPORT_META --></div></div></div>
 <div class="cards" id="cards"></div>
 <div class="filters">
 <div class="control">
@@ -83,12 +83,19 @@ const videoFiltersEl=document.getElementById('videoFilters'),audioFiltersEl=docu
 const videoToggleEl=document.getElementById('videoToggle'),audioToggleEl=document.getElementById('audioToggle'),extToggleEl=document.getElementById('extToggle'),mediaTypeToggleEl=document.getElementById('mediaTypeToggle');
 const exportBtn=document.getElementById('exportBtn'),qualColsToggle=document.getElementById('qualityColsToggle'),showDupesToggle=document.getElementById('showDupesToggle');
 const themeToggleEl=document.getElementById('themeToggle');
+const reportMetaEl=document.getElementById('reportMeta');
 const THEME_KEY='metadata_report_theme';
+const pageParams=new URLSearchParams(window.location.search);
+const dataSource=pageParams.get('data')||'metadata.ndjson';
+const reportTitleOverride=pageParams.get('title');
+const reportMetaOverride=pageParams.get('meta');
 const setTheme=t=>{const theme=t==='light'?'light':'dark';document.documentElement.setAttribute('data-theme',theme);themeToggleEl.textContent=`Theme: ${theme==='dark'?'Dark':'Light'}`;try{localStorage.setItem(THEME_KEY,theme);}catch(_){}};
 let initialTheme='dark';
 try{initialTheme=localStorage.getItem(THEME_KEY)||'dark';}catch(_){initialTheme='dark';}
 setTheme(initialTheme);
 themeToggleEl.onclick=()=>{const current=document.documentElement.getAttribute('data-theme')||'dark';setTheme(current==='dark'?'light':'dark');};
+if(reportTitleOverride){document.title=reportTitleOverride;}
+if(reportMetaOverride&&reportMetaEl){reportMetaEl.textContent=reportMetaOverride;}
 const toArray=v=>Array.isArray(v)?v:(v==null?[]:[v]);
 const fmtDuration=ms=>{if(!ms||ms<=0)return '-';const t=Math.round(ms/1000),h=Math.floor(t/3600),m=Math.floor((t%3600)/60),s=t%60;return h>0?`${h}h ${m}m ${s}s`:`${m}m ${s}s`;};
 const audioLabel=a=>{const p=[];if(a.lang)p.push(a.lang);if(a.codec)p.push(a.codec);if(a.channels)p.push(`${a.channels}ch`);return p.join(':');};
@@ -132,12 +139,12 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!detailsOverlayEl.c
 (async()=>{
   let rawData;
   try {
-    const res=await fetch('./metadata.ndjson');
+    const res=await fetch(`./${dataSource}`);
     if(!res.ok)throw new Error(`HTTP ${res.status}`);
     const text=await res.text();
     rawData=text.trim().split('\n').filter(Boolean).map(l=>JSON.parse(l));
   } catch(err) {
-    captionEl.textContent=`Cannot load metadata.ndjson \u2014 ${err.message}. Open via a local HTTP server (e.g. python -m http.server).`;
+    captionEl.textContent=`Cannot load ${dataSource} \u2014 ${err.message}. Open via a local HTTP server (e.g. python -m http.server).`;
     return;
   }
   const norm=rawData.map(r=>{const path=String(r.path||'');const filename=path.split('\\').pop()||path;const ext=(filename.includes('.')?filename.slice(filename.lastIndexOf('.')).toLowerCase():'').trim();const audioArr=toArray(r.audio);const subArr=toArray(r.subtitles).filter(Boolean).map(s=>String(s));const tags=toArray(r.tags).map(t=>String(t));const video=r.video||{};const width=Number(video.width||0),height=Number(video.height||0);const library=String(r.library||'').trim()||deriveLibraryFromPath(path);const mediaType=classifyMediaType(ext);return{raw:r,path,filename,ext,library,mediaType,size:Number(r.size||0),durationMs:Number(r.duration||0),codec:String(video.codec||'n/a').toLowerCase(),width,height,hdr:Boolean(video.hdr),audioArr,subArr,tags,hash:String(r.hash||'')};});

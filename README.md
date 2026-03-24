@@ -35,7 +35,7 @@ The script supports a metadata analysis mode (`-Analyze`) that scans video files
 - **Theme Toggle**: Report defaults to dark theme and allows in-browser dark/light switching
 - **Automatic Compaction**: Removes entries for deleted files and maintains current state
 - **Parallel Run Prevention**: Uses mutex to prevent concurrent analysis runs on the same directory
-- **Hash Strategies**: Supports `size-mtime` change tracking (Analyze default, fastest), plus MD5 and SHA256 content hashing
+- **Hash Strategies**: Supports `size-mtime` change tracking (Analyze default, fastest) or `crc32` content hashing
 
 ### Usage
 
@@ -43,14 +43,17 @@ The script supports a metadata analysis mode (`-Analyze`) that scans video files
 # Basic analysis (default uses size+mtime change tracking for speed)
 .\ffmpeg_h265.ps1 -Path "Z:\Movies" -Analyze
 
-# Force MD5 content hashing
-.\ffmpeg_h265.ps1 -Path "Z:\Movies" -Analyze -HashAlgorithm md5
-
-# Use SHA256 for stronger hashing
-.\ffmpeg_h265.ps1 -Path "Z:\Movies" -Analyze -HashAlgorithm sha256
+# Use CRC32 content hashing (faster than MD5/SHA256)
+.\ffmpeg_h265.ps1 -Path "Z:\Movies" -Analyze -HashAlgorithm crc32
 
 # Compact existing metadata (remove deleted files)
 .\ffmpeg_h265.ps1 -Path "Z:\Movies" -Compact
+
+# Analyze and open the runtime report via local server helper
+.\ffmpeg_h265.ps1 -Path "Z:\Movies" -Analyze -ViewReport
+
+# Open the runtime report without running analyze/encode
+.\ffmpeg_h265.ps1 -ViewReport
 ```
 
 ### Output Files
@@ -64,8 +67,8 @@ Analysis creates the following files in the resolved log/output directory (`log_
 
 The repository includes sample analysis artifacts that are intended to work standalone when opened locally:
 
-- `metadata.ndjson`: sample NDJSON metadata data
-- `metadata_report.html`: self-contained sample report generated from sample NDJSON (dark by default, user-switchable theme)
+- `metadata_report_sample.ndjson`: sample NDJSON metadata data with sanitized sample titles
+- `metadata_report_sample.html`: sample report entry point that loads the sample NDJSON
 - The HTML report template is embedded in the script and generated at runtime (there is no standalone template file in the repo)
 
 These sample files are examples only. Runtime Analyze output is still written to your configured output directory (`log_path` / `FFENC_LOG_PATH`).
@@ -76,13 +79,17 @@ The report fetches NDJSON data from the browser, so opening `metadata_report.htm
 
 Preferred (repo helper script):
 
-`serve_report.ps1` starts a local HTTP server from the repo directory and automatically opens `metadata_report.html` in your default browser.
+`serve_report.ps1` starts a local HTTP server from the repo directory and automatically opens `metadata_report_sample.html` in your default browser by default. Use `-Report runtime` to open `metadata_report.html` instead.
+
+You can also launch the runtime report viewer from the primary script by using `-ViewReport` (standalone, or combined with `-Analyze`). In standalone mode, it does not require `-Path` or config discovery.
 
 ```powershell
 cd C:\Users\Administrator\source\repos\ffmpeg_h265
 .\serve_report.ps1
 # Optional custom port:
 # .\serve_report.ps1 -Port 8000
+# Open the runtime report instead of the sample report:
+# .\serve_report.ps1 -Report runtime
 ```
 
 Fallback examples:
@@ -155,7 +162,7 @@ For environment/deployment settings, precedence is always:
 
 For `log_path`, step 3 is different: if missing from env/config, the script falls back to config discovery locations (loaded config directory, then current directory, then script directory).
 
-`-ConfigPath` is the only configuration-related parameter and only controls where config is loaded from.
+`-ConfigPath` is the only configuration-related parameter and only controls where config is loaded from. It is not needed for standalone `-ViewReport`.
 
 ### Config File (Optional Fallback)
 
@@ -229,6 +236,8 @@ Explicitly specify where to load ffmpeg_h265.config.json from:
 ```
 
 This overrides automatic discovery and only looks in the specified directory.
+
+Standalone `-ViewReport` does not load the encoder/analyze configuration path at all, so `-ConfigPath` and `FFENC_CONFIGPATH` are ignored in that mode.
 
 Alternatively, set the `FFENC_CONFIGPATH` environment variable to avoid passing the parameter each time:
 
@@ -354,7 +363,7 @@ Use environment variables as primary config (checked first), with ConfigPath as 
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `-Path` | string | Input path containing video files to convert |
+| `-Path` | string | Required for encode and `-Analyze` runs; optional for `-Compact` and standalone `-ViewReport` |
 
 ### Optional Parameters
 
@@ -383,7 +392,11 @@ Use environment variables as primary config (checked first), with ConfigPath as 
 | `-SubLang` | string[] | @("eng") | ISO 639-2 subtitle language codes to keep; supports one or many values |
 | `-LastRunDate` | datetime | - | Only process files modified after this date |
 | `-SkipFileLock` | switch | false | Skip file lock check (process files even if in use) |
-| `-ConfigPath` | string | "" | Directory containing ffmpeg_h265.config.json (overrides auto-discovery) |
+| `-Analyze` | switch | false | Analyze metadata and generate report files without encoding |
+| `-Compact` | switch | false | Compact existing metadata report data (remove deleted files) |
+| `-HashAlgorithm` | string | "size-mtime" | Analyze hash strategy: `size-mtime` (fastest, default) or `crc32` |
+| `-ViewReport` | switch | false | Launch report viewer helper (`serve_report.ps1 -Report runtime`) and open the runtime report; when used alone it does not require `-Path` or config loading |
+| `-ConfigPath` | string | "" | Directory containing ffmpeg_h265.config.json (overrides auto-discovery for encode/analyze/compact modes) |
 | `-Encoder` | string | "auto" | Encoder profile: `auto`, `nvenc`, `amf`, `qsv`, `software` |
 
 When `-Encoder auto` is used (default), the script detects available HEVC encoders from ffmpeg and picks one automatically. Set `-Encoder` to a specific value to bypass detection.

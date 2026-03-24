@@ -11,7 +11,7 @@ param(
   # Runtime-scope parameters belong here (scan behavior, filters, encoding, logging toggles).
   # Environment/deployment settings (paths, endpoints, API keys) are intentionally
   # resolved from env/config to avoid a duplicated parameter surface.
-  [Parameter(Mandatory = $true)][string] $Path,
+  [Parameter(Mandatory = $false)][string] $Path,
   [Parameter(Mandatory = $false)][int] $MaxParallelJobs = 3,
   [Parameter(Mandatory = $false)][switch] $ShowOutputCmd,
   [Parameter(Mandatory = $false)][switch] $NoProgress,
@@ -38,7 +38,8 @@ param(
   [Parameter(Mandatory = $false, HelpMessage = "Directory containing the .config.json file")][string] $ConfigPath = "",
   [Parameter(Mandatory = $false, HelpMessage = "Hardware encoder profile: auto, nvenc, amf, qsv, software")][ValidateSet('auto', 'nvenc', 'amf', 'qsv', 'software')][string] $Encoder = 'auto',
   [Parameter(Mandatory = $false)][switch] $Analyze,
-  [Parameter(Mandatory = $false)][ValidateSet('md5', 'sha256', 'size-mtime')][string] $HashAlgorithm = 'size-mtime',
+  [Parameter(Mandatory = $false)][switch] $ViewReport,
+  [Parameter(Mandatory = $false)][ValidateSet('size-mtime', 'crc32')][string] $HashAlgorithm = 'size-mtime',
   [Parameter(Mandatory = $false)][switch] $Compact
 )
 
@@ -104,6 +105,7 @@ $script:RunConfig = [ordered]@{
   ConfigPath           = $ConfigPath
   Encoder              = $Encoder
   Analyze              = $Analyze.IsPresent
+  ViewReport           = $ViewReport.IsPresent
   Compact              = $Compact.IsPresent
   HashAlgorithm        = $HashAlgorithm
 }
@@ -363,6 +365,25 @@ function Resolve-Config {
     ConfigFileNames        = @($resolvedConfigFileNames)
     SearchedPaths          = $searchedPaths
   }
+}
+
+# Standalone -ViewReport: no -Path and no config file needed — launch viewer and exit immediately.
+if ($ViewReport -and -not $Analyze -and -not $Compact) {
+  $serveScriptPath = Join-Path $PSScriptRoot 'serve_report.ps1'
+  if (-not (Test-Path -LiteralPath $serveScriptPath -PathType Leaf -ErrorAction SilentlyContinue)) {
+    Write-Error "Cannot open report viewer because '$serveScriptPath' was not found."
+    exit 1
+  }
+  $pwshCommand = if ($PSVersionTable.PSEdition -ieq 'Core') { 'pwsh' } else { 'powershell' }
+  $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $serveScriptPath, '-Report', 'runtime')
+  try {
+    Start-Process -FilePath $pwshCommand -ArgumentList $argList -WorkingDirectory $PSScriptRoot | Out-Null
+    Write-Host "Started report server helper using '$serveScriptPath'." -ForegroundColor Cyan
+  } catch {
+    Write-Error "Failed to start report server helper '$serveScriptPath': $($_.Exception.Message)"
+    exit 1
+  }
+  exit 0
 }
 
 $autoDiscoveryLocations = @(
@@ -1418,7 +1439,7 @@ function Get-FileMetadata {
   [OutputType([hashtable])]
   param(
     [Parameter(Mandatory = $true)][string]$FilePath,
-    [Parameter(Mandatory = $false)][string]$HashAlgorithm = 'md5'
+    [Parameter(Mandatory = $false)][string]$HashAlgorithm = 'size-mtime'
   )
 
   $metadata = @{
@@ -1449,18 +1470,19 @@ function Get-FileMetadata {
       $metadata.hash = "size-mtime:$($metadata.size):$($fileInfo.LastWriteTimeUtc.Ticks)"
     }
     else {
-      $hashAlgo = switch ($HashAlgorithm) {
-        'md5' { [System.Security.Cryptography.MD5]::Create() }
-        'sha256' { [System.Security.Cryptography.SHA256]::Create() }
-      }
+      # CRC32 via System.IO.Hashing (available in .NET 6+ / PS 7.x)
       $stream = [System.IO.File]::OpenRead($FilePath)
       try {
-        $hashBytes = $hashAlgo.ComputeHash($stream)
-        $metadata.hash = [BitConverter]::ToString($hashBytes).Replace('-', '').ToLower()
+        $crc = [System.IO.Hashing.Crc32]::new()
+        $buffer = [byte[]]::new(65536)
+        [int]$read = 0
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+          $crc.Append([System.ReadOnlySpan[byte]]::new($buffer, 0, $read))
+        }
+        $metadata.hash = 'crc32:{0:x8}' -f $crc.GetCurrentHashAsUInt32()
       } finally {
         $stream.Dispose()
       }
-      $hashAlgo.Dispose()
     }
   } catch {
     Write-ParallelLog -Message "Failed to compute hash for '$FilePath': $($_.Exception.Message)" -Level Error
@@ -1714,6 +1736,40 @@ function Invoke-CompactMetadata {
   }
 
   Write-ParallelLog -Message "Compacted metadata: $($currentEntries.Count) current entries"
+}
+
+function Start-ReportViewer {
+  [OutputType([bool])]
+  param(
+    [ValidateSet('sample', 'runtime')][string]$Report = 'runtime'
+  )
+
+  $serveScriptPath = Join-Path $PSScriptRoot 'serve_report.ps1'
+  if (-not (Test-Path -LiteralPath $serveScriptPath -PathType Leaf -ErrorAction SilentlyContinue)) {
+    Write-ParallelLog -Message "Cannot open report viewer because '$serveScriptPath' was not found." -Level Error -Target Both
+    return $false
+  }
+
+  $pwshCommand = if ($PSVersionTable.PSEdition -ieq 'Core') { 'pwsh' } else { 'powershell' }
+  $argList = @(
+    '-NoProfile',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-File',
+    $serveScriptPath,
+    '-Report',
+    $Report
+  )
+
+  try {
+    Start-Process -FilePath $pwshCommand -ArgumentList $argList -WorkingDirectory $PSScriptRoot | Out-Null
+    Write-ParallelLog -Message "Started report server helper using '$serveScriptPath' (mode=$Report)." -Target Both
+    return $true
+  }
+  catch {
+    Write-ParallelLog -Message "Failed to start report server helper '$serveScriptPath': $($_.Exception.Message)" -Level Error -Target Both
+    return $false
+  }
 }
 
 function Get-OutputPath {
@@ -2758,6 +2814,21 @@ if ($oldLogs.Count -gt 0) {
   }
 }
 
+$hasInputPath = -not [string]::IsNullOrWhiteSpace($Path)
+
+if (($Analyze -or (-not $Compact -and -not $ViewReport)) -and -not $hasInputPath) {
+  Write-ParallelLog -Message "-Path is required for encode and analyze runs." -Level Error -Target Both
+  exit 1
+}
+
+if ($ViewReport -and -not $Analyze -and -not $Compact) {
+  if (-not (Start-ReportViewer -Report 'runtime')) {
+    exit 1
+  }
+
+  exit 0
+}
+
 # Handle -Analyze and -Compact modes
 if ($Analyze -or $Compact) {
   # Keep analysis artifacts with encode logs so all run outputs are in one place.
@@ -2797,6 +2868,13 @@ if ($Analyze -or $Compact) {
       Unregister-AnalyzeTempArtifact -Path $inProgressNdjsonPath
       Remove-AnalyzeTempArtifacts -OutputDir $outputDir
       Write-ParallelLog -Message "Compaction completed" -Target Both
+
+      if ($ViewReport) {
+        if (-not (Start-ReportViewer -Report 'runtime')) {
+          exit 1
+        }
+      }
+
       exit 0
     }
 
@@ -2888,6 +2966,12 @@ if ($Analyze -or $Compact) {
     if ($mutex) {
       try { $mutex.ReleaseMutex() } catch { }
       try { $mutex.Dispose() } catch { }
+    }
+  }
+
+  if ($ViewReport) {
+    if (-not (Start-ReportViewer -Report 'runtime')) {
+      exit 1
     }
   }
 

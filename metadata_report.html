@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Metadata Report (Sample)</title>
+  <title>Metadata Report</title>
   <style>
     :root[data-theme="dark"] { --bg:#0b0f1a; --bg-top:#131f38; --panel:#12192b; --panel-alt:#18233d; --line:#243352; --text:#e8f0ff; --muted:#95a7cd; --accent:#4ea1ff; --accent2:#ffcf4e; --ok:#47d18c; --warn:#ff9458; --control-bg:#0e1527; --thead-bg:#141f36; --row-border:#1f2a44; --row-hover:#121f38; --row-text:#d7e5ff; --sep:#3f567f; --pill-border:#3562a5; --pill-bg:#102244; --pill-text:#7cb0ff; --pill-on-bg:#4ea1ff; --pill-on-text:#ffffff; --pill-on-border:#7cb0ff; --toggle-on-bg:#1d3f70; --toggle-on-text:#d7e9ff; --toggle-on-border:#5a93d6; --flag-warn-bg:#3a1f00; --flag-warn-border:#6b3800; --flag-bad-bg:#2a0010; --flag-bad-border:#6b0028; --flag-info-bg:#001d3a; --flag-info-border:#1a4a7a; --overlay:rgba(6,10,18,.82); --details-pre:#0b1222; }
     :root[data-theme="light"] { --bg:#eef3fb; --bg-top:#ffffff; --panel:#ffffff; --panel-alt:#f4f8ff; --line:#cad7ea; --text:#1b2a40; --muted:#5f7393; --accent:#1f6fd6; --accent2:#ad7a00; --ok:#197a52; --warn:#b1541d; --control-bg:#f8fbff; --thead-bg:#edf3fc; --row-border:#d9e4f3; --row-hover:#f2f7ff; --row-text:#243853; --sep:#93a8c6; --pill-border:#8eb0dc; --pill-bg:#e9f1ff; --pill-text:#295fa8; --pill-on-bg:#1f6fd6; --pill-on-text:#ffffff; --pill-on-border:#1f6fd6; --toggle-on-bg:#d9e9ff; --toggle-on-text:#174b8f; --toggle-on-border:#7ea7db; --flag-warn-bg:#fff1e3; --flag-warn-border:#e1ba89; --flag-bad-bg:#ffe8ef; --flag-bad-border:#db95ab; --flag-info-bg:#e7f1ff; --flag-info-border:#9eb8de; --overlay:rgba(24,35,56,.45); --details-pre:#f4f8ff; }
@@ -32,7 +32,7 @@
   </style>
 </head>
 <body>
-<div class="wrap"><div class="topbar"><div class="title">MEDIA<span>AUDIT</span></div><div style="display:flex;align-items:center;gap:10px"><button id="themeToggle" class="toolbar-btn" type="button">Theme: Dark</button><div class="meta">Sample report &bull; loads metadata.ndjson</div></div></div>
+<div class="wrap"><div class="topbar"><div class="title">MEDIA<span>AUDIT</span></div><div style="display:flex;align-items:center;gap:10px"><button id="themeToggle" class="toolbar-btn" type="button">Theme: Dark</button><div class="meta" id="reportMeta"><!-- REPORT_META --></div></div></div>
 <div class="cards" id="cards"></div>
 <div class="filters">
 <div class="control">
@@ -83,12 +83,19 @@ const videoFiltersEl=document.getElementById('videoFilters'),audioFiltersEl=docu
 const videoToggleEl=document.getElementById('videoToggle'),audioToggleEl=document.getElementById('audioToggle'),extToggleEl=document.getElementById('extToggle'),mediaTypeToggleEl=document.getElementById('mediaTypeToggle');
 const exportBtn=document.getElementById('exportBtn'),qualColsToggle=document.getElementById('qualityColsToggle'),showDupesToggle=document.getElementById('showDupesToggle');
 const themeToggleEl=document.getElementById('themeToggle');
+const reportMetaEl=document.getElementById('reportMeta');
 const THEME_KEY='metadata_report_theme';
+const pageParams=new URLSearchParams(window.location.search);
+const dataSource=pageParams.get('data')||'metadata.ndjson';
+const reportTitleOverride=pageParams.get('title');
+const reportMetaOverride=pageParams.get('meta');
 const setTheme=t=>{const theme=t==='light'?'light':'dark';document.documentElement.setAttribute('data-theme',theme);themeToggleEl.textContent=`Theme: ${theme==='dark'?'Dark':'Light'}`;try{localStorage.setItem(THEME_KEY,theme);}catch(_){}};
 let initialTheme='dark';
 try{initialTheme=localStorage.getItem(THEME_KEY)||'dark';}catch(_){initialTheme='dark';}
 setTheme(initialTheme);
 themeToggleEl.onclick=()=>{const current=document.documentElement.getAttribute('data-theme')||'dark';setTheme(current==='dark'?'light':'dark');};
+if(reportTitleOverride){document.title=reportTitleOverride;}
+if(reportMetaOverride&&reportMetaEl){reportMetaEl.textContent=reportMetaOverride;}
 const toArray=v=>Array.isArray(v)?v:(v==null?[]:[v]);
 const fmtDuration=ms=>{if(!ms||ms<=0)return '-';const t=Math.round(ms/1000),h=Math.floor(t/3600),m=Math.floor((t%3600)/60),s=t%60;return h>0?`${h}h ${m}m ${s}s`:`${m}m ${s}s`;};
 const audioLabel=a=>{const p=[];if(a.lang)p.push(a.lang);if(a.codec)p.push(a.codec);if(a.channels)p.push(`${a.channels}ch`);return p.join(':');};
@@ -132,12 +139,12 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!detailsOverlayEl.c
 (async()=>{
   let rawData;
   try {
-    const res=await fetch('./metadata.ndjson');
+    const res=await fetch(`./${dataSource}`);
     if(!res.ok)throw new Error(`HTTP ${res.status}`);
     const text=await res.text();
     rawData=text.trim().split('\n').filter(Boolean).map(l=>JSON.parse(l));
   } catch(err) {
-    captionEl.textContent=`Cannot load metadata.ndjson \u2014 ${err.message}. Open via a local HTTP server (e.g. python -m http.server).`;
+    captionEl.textContent=`Cannot load ${dataSource} \u2014 ${err.message}. Open via a local HTTP server (e.g. python -m http.server).`;
     return;
   }
   const norm=rawData.map(r=>{const path=String(r.path||'');const filename=path.split('\\').pop()||path;const ext=(filename.includes('.')?filename.slice(filename.lastIndexOf('.')).toLowerCase():'').trim();const audioArr=toArray(r.audio);const subArr=toArray(r.subtitles).filter(Boolean).map(s=>String(s));const tags=toArray(r.tags).map(t=>String(t));const video=r.video||{};const width=Number(video.width||0),height=Number(video.height||0);const library=String(r.library||'').trim()||deriveLibraryFromPath(path);const mediaType=classifyMediaType(ext);return{raw:r,path,filename,ext,library,mediaType,size:Number(r.size||0),durationMs:Number(r.duration||0),codec:String(video.codec||'n/a').toLowerCase(),width,height,hdr:Boolean(video.hdr),audioArr,subArr,tags,hash:String(r.hash||'')};});
@@ -181,4 +188,3 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!detailsOverlayEl.c
 </script>
 </body>
 </html>
-
