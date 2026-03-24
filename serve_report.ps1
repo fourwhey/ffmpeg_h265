@@ -1,10 +1,15 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-  Serves the metadata sample report over HTTP for local viewing.
+  Starts a local HTTP server and opens the metadata report in the browser.
 .DESCRIPTION
-  Starts a System.Net.HttpListener on the specified port, serves files from the
-  script directory, and opens the sample report in the default browser.
+  Starts a System.Net.HttpListener on the specified port, serves files from this
+  script directory, and opens metadata_report.html from that served root in the
+  default browser.
+.NOTES
+  - Base URL: http://localhost:<Port>/
+  - Default page: metadata_report.html
+  - Press Ctrl+C to stop the server.
 #>
 param(
   [int] $Port = 8080

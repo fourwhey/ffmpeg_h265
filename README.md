@@ -31,7 +31,8 @@ The script supports a metadata analysis mode (`-Analyze`) that scans video files
 
 - **Comprehensive Metadata**: Collects file hashes, timestamps, video/audio/subtitle details, and FFprobe data
 - **NDJSON Output**: Appends metadata to a newline-delimited JSON file for efficient processing
-- **HTML Reports**: Generates an interactive dark-theme dashboard with top-level filters, metric cards, and searchable metadata tables
+- **HTML Reports**: Generates an interactive metadata dashboard with top-level filters, metric cards, and searchable metadata tables
+- **Theme Toggle**: Report defaults to dark theme and allows in-browser dark/light switching
 - **Automatic Compaction**: Removes entries for deleted files and maintains current state
 - **Parallel Run Prevention**: Uses mutex to prevent concurrent analysis runs on the same directory
 - **Hash Strategies**: Supports `size-mtime` change tracking (Analyze default, fastest), plus MD5 and SHA256 content hashing
@@ -64,10 +65,41 @@ Analysis creates the following files in the resolved log/output directory (`log_
 The repository includes sample analysis artifacts that are intended to work standalone when opened locally:
 
 - `metadata.ndjson`: sample NDJSON metadata data
-- `metadata_report.html`: self-contained sample dark-theme report generated from sample NDJSON
+- `metadata_report.html`: self-contained sample report generated from sample NDJSON (dark by default, user-switchable theme)
 - The HTML report template is embedded in the script and generated at runtime (there is no standalone template file in the repo)
 
 These sample files are examples only. Runtime Analyze output is still written to your configured output directory (`log_path` / `FFENC_LOG_PATH`).
+
+### Viewing the HTML Report
+
+The report fetches NDJSON data from the browser, so opening `metadata_report.html` directly via `file://` will not work reliably. Run a local web server from the directory that contains the report and NDJSON file, then open the served URL.
+
+Preferred (repo helper script):
+
+`serve_report.ps1` starts a local HTTP server from the repo directory and automatically opens `metadata_report.html` in your default browser.
+
+```powershell
+cd C:\Users\Administrator\source\repos\ffmpeg_h265
+.\serve_report.ps1
+# Optional custom port:
+# .\serve_report.ps1 -Port 8000
+```
+
+Fallback examples:
+
+```powershell
+# Python 3
+cd C:\Users\Administrator\source\repos\ffmpeg_h265
+python -m http.server 8000
+# Open: http://localhost:8000/metadata_report.html
+```
+
+```powershell
+# Node.js
+cd C:\Users\Administrator\source\repos\ffmpeg_h265
+npx serve -l 8000
+# Open: http://localhost:8000/metadata_report.html
+```
 
 ### Metadata Schema
 
