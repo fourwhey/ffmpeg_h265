@@ -422,8 +422,8 @@ When `-LogEnabled` is specified, logs are created in the configured log director
 Logs are written to `log_path` from config (or `FFMPEG_LOG_PATH` from environment variables).
 If `log_path` is not provided, the script uses config discovery locations (loaded config directory, then current directory, Documents, script directory).
 
-- **Main Log Format**: `ffmpeg_h265_YYYYMMDDHHMMSSFFFF.log`
-- **Per-Job Progress Log Format**: `ffmpeg_h265_progress_job{JobId}_YYYYMMDDHHMMSS.log` (when `-LogVerbose` is enabled)
+- **Main Log Format**: `ffmpeg_h265_YYYYMMDDHHMMSSFFFF_{PID}.log`
+- **Per-Job Progress Log Format**: `ffmpeg_h265_progress_job{JobId}_YYYYMMDDHHMMSS_{PID}.log` (when `-LogVerbose` is enabled)
 - **Auto-cleanup**: Logs older than 24 hours or smaller than 2KB are automatically removed
 - **Thread-safe**: Mutex-protected logging for parallel operations
 

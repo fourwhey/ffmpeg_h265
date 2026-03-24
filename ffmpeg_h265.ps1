@@ -166,7 +166,7 @@ if ($callerFrame -and -not [string]::IsNullOrWhiteSpace($callerFrame.ScriptName)
 }
 
 $script:LogPrefix = $invokedScriptName
-$script:logFileName = "${script:LogPrefix}_$(Get-Date -Format "yyyyMMddHHmmssffff").log"
+$script:logFileName = "${script:LogPrefix}_$(Get-Date -Format "yyyyMMddHHmmssffff")_$($PID).log"
 $script:logFilePath = $null
 $script:LogMutexName = if ($IsWindows) { "Global\${script:LogPrefix}_log" }
 else { "${script:LogPrefix}_log" }
@@ -2075,7 +2075,7 @@ function Start-EncodeProcess {
 
   # Open a per-job progress dump file for raw postmortem analysis.
   if ($LogVerbose) {
-    $dumpName = "${script:LogPrefix}_progress_job${JobId}_$(Get-Date -Format 'yyyyMMddHHmmss').log"
+    $dumpName = "${script:LogPrefix}_progress_job${JobId}_$(Get-Date -Format 'yyyyMMddHHmmss')_$($PID).log"
     $dumpPath = Join-Path $script:log_path $dumpName
     try {
       $sw = [System.IO.StreamWriter]::new($dumpPath, $false, [System.Text.Encoding]::UTF8)
