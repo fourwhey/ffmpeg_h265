@@ -31,7 +31,6 @@ The script supports a metadata analysis mode (`-Analyze`) that scans video files
 
 - **Comprehensive Metadata**: Collects file hashes, timestamps, video/audio/subtitle details, and FFprobe data
 - **NDJSON Output**: Appends metadata to a newline-delimited JSON file for efficient processing
-- **Index Sidecar**: Maintains a fast-lookup index with file offsets and timestamps
 - **HTML Reports**: Generates an interactive dark-theme dashboard with top-level filters, metric cards, and searchable metadata tables
 - **Automatic Compaction**: Removes entries for deleted files and maintains current state
 - **Parallel Run Prevention**: Uses mutex to prevent concurrent analysis runs on the same directory
@@ -58,7 +57,6 @@ The script supports a metadata analysis mode (`-Analyze`) that scans video files
 Analysis creates the following files in the resolved log/output directory (`log_path` / `FFENC_LOG_PATH`):
 
 - `metadata.ndjson`: Newline-delimited JSON with one metadata object per line
-- `metadata_index.json`: Index array for fast lookup by path and timestamp
 - `metadata_report.html`: HTML table visualization of library metadata
 
 ### Repository Samples
@@ -66,7 +64,6 @@ Analysis creates the following files in the resolved log/output directory (`log_
 The repository includes sample analysis artifacts that are intended to work standalone when opened locally:
 
 - `metadata.ndjson`: sample NDJSON metadata data
-- `metadata_index.json`: sample index sidecar
 - `metadata_report.html`: self-contained sample dark-theme report generated from sample NDJSON
 - The HTML report template is embedded in the script and generated at runtime (there is no standalone template file in the repo)
 
