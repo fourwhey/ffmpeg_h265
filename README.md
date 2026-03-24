@@ -84,7 +84,7 @@ Preferred (repo helper script):
 You can also launch the runtime report viewer from the primary script by using `-ViewReport` (standalone, or combined with `-Analyze`). In standalone mode, it does not require `-Path` or config discovery.
 
 ```powershell
-cd C:\Users\Administrator\source\repos\ffmpeg_h265
+cd ~/scripts/ffmpeg_h265
 .\serve_report.ps1
 # Optional custom port:
 # .\serve_report.ps1 -Port 8000
@@ -96,14 +96,14 @@ Fallback examples:
 
 ```powershell
 # Python 3
-cd C:\Users\Administrator\source\repos\ffmpeg_h265
+cd ~/scripts/ffmpeg_h265
 python -m http.server 8000
 # Open: http://localhost:8000/metadata_report.html
 ```
 
 ```powershell
 # Node.js
-cd C:\Users\Administrator\source\repos\ffmpeg_h265
+cd ~/scripts/ffmpeg_h265
 npx serve -l 8000
 # Open: http://localhost:8000/metadata_report.html
 ```
