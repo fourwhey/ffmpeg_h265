@@ -20,6 +20,7 @@ This script automates the batch conversion of video files to H.265 format using 
 - **Media Server Integration**: Automatic refresh of Radarr (movies) and Sonarr (TV shows) after processing
 - **Thread-safe Logging**: Detailed logging with job-specific tracking and verbose mode
 - **Graceful Cancellation**: Ctrl+C handling with proper cleanup of running processes
+- **Faster Test Preflight**: Per-job ffmpeg capability tests now use reduced probe settings (`-analyzeduration 64M -probesize 64M`) and a narrow video-only frame sample (`-map 0:v:0 -an -sn -dn -frames:v 48`) before full encode starts; AV1 inputs run a one-time CUDA decode capability probe per run, and when unsupported the script skips initial CUDA decode test variants and begins from a safer fallback path
 - **Incremental Processing**: Skip already-converted files and resume interrupted batches
 - **Metadata Analysis Mode**: Scan video libraries and generate comprehensive metadata reports with HTML visualization
 

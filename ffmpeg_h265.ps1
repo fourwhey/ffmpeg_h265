@@ -67,6 +67,16 @@ $script:TotalWorkCount = 0
 $script:FFprobeTimeoutSeconds = 90
 $script:HWProfile = $null
 $script:AnalyzeTempArtifacts = [System.Collections.Generic.List[string]]::new()
+$script:ProcessJobHandle = [IntPtr]::Zero
+$script:ProcessJobEnabled = $false
+$script:ProcessJobAssignFailed = $false
+$script:ContainmentWarningEmitted = $false
+$script:ChildWatchdogProcess = $null
+$script:TestProbeAnalyzeDuration = '64M'
+$script:TestProbeSize = '64M'
+$script:TestFrameCount = 48
+$script:CudaAv1DecodeSupportKnown = $false
+$script:CudaAv1DecodeSupported = $false
 
 if ($Analyze.IsPresent -and (-not $PSBoundParameters.ContainsKey('HashAlgorithm'))) {
   $HashAlgorithm = 'size-mtime'
@@ -74,6 +84,215 @@ if ($Analyze.IsPresent -and (-not $PSBoundParameters.ContainsKey('HashAlgorithm'
 
 if ($PSVersionTable.PSVersion -lt [version]'7.5.0') {
   throw "This script requires PowerShell 7.5 or newer. Current version: $($PSVersionTable.PSVersion)"
+}
+
+function Initialize-ChildProcessContainment {
+  [CmdletBinding()]
+  param()
+
+  if (-not $IsWindows) { return }
+  if ($script:ProcessJobEnabled) { return }
+
+  try {
+    if (-not ([System.Management.Automation.PSTypeName]'FfmpegH265.JobObjectNative').Type) {
+      Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+namespace FfmpegH265 {
+  [Flags]
+  public enum JobObjectLimitFlags : uint {
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  public struct IO_COUNTERS {
+    public ulong ReadOperationCount;
+    public ulong WriteOperationCount;
+    public ulong OtherOperationCount;
+    public ulong ReadTransferCount;
+    public ulong WriteTransferCount;
+    public ulong OtherTransferCount;
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  public struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+    public long PerProcessUserTimeLimit;
+    public long PerJobUserTimeLimit;
+    public uint LimitFlags;
+    public UIntPtr MinimumWorkingSetSize;
+    public UIntPtr MaximumWorkingSetSize;
+    public uint ActiveProcessLimit;
+    public UIntPtr Affinity;
+    public uint PriorityClass;
+    public uint SchedulingClass;
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  public struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+    public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+    public IO_COUNTERS IoInfo;
+    public UIntPtr ProcessMemoryLimit;
+    public UIntPtr JobMemoryLimit;
+    public UIntPtr PeakProcessMemoryUsed;
+    public UIntPtr PeakJobMemoryUsed;
+  }
+
+  public static class JobObjectNative {
+    public const int JobObjectExtendedLimitInformation = 9;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string lpName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetInformationJobObject(IntPtr hJob, int JobObjectInfoClass, IntPtr lpJobObjectInfo, uint cbJobObjectInfoLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+  }
+}
+"@ -Language CSharp -ErrorAction Stop
+    }
+
+    $jobHandle = [FfmpegH265.JobObjectNative]::CreateJobObject([IntPtr]::Zero, $null)
+    if ($jobHandle -eq [IntPtr]::Zero) {
+      Write-VerboseParallelLog -Message "Process containment unavailable: CreateJobObject failed (Win32=$([Runtime.InteropServices.Marshal]::GetLastWin32Error()))."
+      return
+    }
+
+    $limitInfo = [FfmpegH265.JOBOBJECT_EXTENDED_LIMIT_INFORMATION]::new()
+    $limitInfo.BasicLimitInformation.LimitFlags = [uint32][FfmpegH265.JobObjectLimitFlags]::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+
+    $size = [Runtime.InteropServices.Marshal]::SizeOf([type][FfmpegH265.JOBOBJECT_EXTENDED_LIMIT_INFORMATION])
+    $ptr = [Runtime.InteropServices.Marshal]::AllocHGlobal($size)
+    try {
+      [Runtime.InteropServices.Marshal]::StructureToPtr($limitInfo, $ptr, $false)
+      $ok = [FfmpegH265.JobObjectNative]::SetInformationJobObject($jobHandle, [FfmpegH265.JobObjectNative]::JobObjectExtendedLimitInformation, $ptr, [uint32]$size)
+      if (-not $ok) {
+        $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        [void][FfmpegH265.JobObjectNative]::CloseHandle($jobHandle)
+        Write-VerboseParallelLog -Message "Process containment unavailable: SetInformationJobObject failed (Win32=$err)."
+        return
+      }
+    }
+    finally {
+      [Runtime.InteropServices.Marshal]::FreeHGlobal($ptr)
+    }
+
+    $script:ProcessJobHandle = $jobHandle
+    $script:ProcessJobEnabled = $true
+    $script:ProcessJobAssignFailed = $false
+    Write-VerboseParallelLog -Message "Process containment enabled (KillOnJobClose)."
+  }
+  catch {
+    $script:ProcessJobHandle = [IntPtr]::Zero
+    $script:ProcessJobEnabled = $false
+    $script:ProcessJobAssignFailed = $true
+    Write-VerboseParallelLog -Message "Process containment initialization failed: $($_.Exception.Message)"
+  }
+}
+
+function Register-ChildProcess {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
+    [Parameter(Mandatory = $false)][int]$JobId = 0
+  )
+
+  if (-not $IsWindows) { return }
+  if (-not $script:ProcessJobEnabled) { return }
+  if ($script:ProcessJobHandle -eq [IntPtr]::Zero) { return }
+  if ($script:ProcessJobAssignFailed) { return }
+
+  try {
+    $assigned = [FfmpegH265.JobObjectNative]::AssignProcessToJobObject($script:ProcessJobHandle, $Process.Handle)
+    if (-not $assigned) {
+      $script:ProcessJobAssignFailed = $true
+      $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+      if (-not $script:ContainmentWarningEmitted) {
+        $script:ContainmentWarningEmitted = $true
+        Write-ParallelLog -Message "Process containment assignment failed (Win32=$err). Falling back to manual/watchdog cleanup." -Level Warning -Target Both
+      }
+      Write-VerboseParallelLog -Message "Process containment assignment failed (Win32=$err). Continuing with fallback cleanup." -JobId $JobId
+    }
+  }
+  catch {
+    $script:ProcessJobAssignFailed = $true
+    if (-not $script:ContainmentWarningEmitted) {
+      $script:ContainmentWarningEmitted = $true
+      Write-ParallelLog -Message "Process containment assignment failed due to exception. Falling back to manual/watchdog cleanup." -Level Warning -Target Both
+    }
+    Write-VerboseParallelLog -Message "Process containment assignment exception: $($_.Exception.Message). Continuing with fallback cleanup." -JobId $JobId
+  }
+}
+
+function Start-ChildProcessWatchdog {
+  [CmdletBinding()]
+  param()
+
+  if (-not $IsWindows) { return }
+  if ($script:ChildWatchdogProcess -and (-not $script:ChildWatchdogProcess.HasExited)) { return }
+
+  try {
+    $watchdogScript = @"
+`$parentPid = $PID
+
+while (Get-Process -Id `$parentPid -ErrorAction SilentlyContinue) {
+  Start-Sleep -Milliseconds 500
+}
+
+Start-Sleep -Seconds 1
+
+try {
+  `$procTable = @{}
+  foreach (`$proc in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
+    `$procTable[[int]`$proc.ProcessId] = `$proc
+  }
+
+  function Test-IsDescendantProcess {
+    param(
+      [int]`$ProcessId,
+      [int]`$AncestorPid,
+      [hashtable]`$Table
+    )
+
+    `$seen = New-Object 'System.Collections.Generic.HashSet[int]'
+    `$current = `$ProcessId
+    while (`$Table.ContainsKey(`$current)) {
+      if (`$seen.Contains(`$current)) { return `$false }
+      [void]`$seen.Add(`$current)
+
+      `$parent = [int]`$Table[`$current].ParentProcessId
+      if (`$parent -eq `$AncestorPid) { return `$true }
+      if (`$parent -le 0 -or `$parent -eq `$current) { return `$false }
+
+      `$current = `$parent
+    }
+
+    return `$false
+  }
+
+  foreach (`$proc in @(`$procTable.Values | Where-Object { `$_.Name -ieq 'ffmpeg.exe' -or `$_.Name -ieq 'ffprobe.exe' })) {
+    if (Test-IsDescendantProcess -ProcessId ([int]`$proc.ProcessId) -AncestorPid `$parentPid -Table `$procTable) {
+      Stop-Process -Id ([int]`$proc.ProcessId) -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+catch { }
+"@
+
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($watchdogScript))
+    $pwshCommand = if ($PSVersionTable.PSEdition -ieq 'Core') { 'pwsh' } else { 'powershell' }
+    $script:ChildWatchdogProcess = Start-Process -FilePath $pwshCommand -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded) -WindowStyle Hidden -PassThru
+    Write-VerboseParallelLog -Message "Child process watchdog started (PID=$($script:ChildWatchdogProcess.Id))."
+  }
+  catch {
+    $script:ChildWatchdogProcess = $null
+    Write-VerboseParallelLog -Message "Unable to start child process watchdog: $($_.Exception.Message)"
+  }
 }
 
 # Snapshot script parameters so compatibility options are explicitly represented and traceable.
@@ -527,6 +746,64 @@ enum ResTypes {
   QHD = 5
   UHD_4K = 6
   FUHD_8K = 7
+}
+
+function Test-CudaAv1DecodeSupport {
+  [CmdletBinding()]
+  [OutputType([bool])]
+  param(
+    [Parameter(Mandatory = $true)][string]$InputPath,
+    [Parameter(Mandatory = $false)][int]$JobId = 0
+  )
+
+  if ([string]::IsNullOrWhiteSpace($InputPath) -or -not (Test-Path -LiteralPath $InputPath -PathType Leaf -ErrorAction SilentlyContinue)) {
+    Write-VerboseParallelLog -Message "CUDA AV1 probe skipped: input path is unavailable ('$InputPath')." -JobId $JobId
+    return $false
+  }
+
+  $probeArgs = "-hide_banner -v error -hwaccel cuda -hwaccel_output_format cuda -analyzeduration 8M -probesize 8M -i `"$InputPath`" -map 0:v:0 -frames:v 2 -f null $($script:NullDevice)"
+  Write-VerboseParallelLog -Message "Running one-time CUDA AV1 decode capability probe: $probeArgs" -JobId $JobId
+
+  $p = New-Object System.Diagnostics.Process
+  $p.StartInfo.FileName = $script:ffmpeg_exe
+  $p.StartInfo.Arguments = $probeArgs
+  $p.StartInfo.UseShellExecute = $false
+  $p.StartInfo.RedirectStandardOutput = $false
+  $p.StartInfo.RedirectStandardError = $true
+  $p.StartInfo.CreateNoWindow = $true
+
+  try {
+    $p.Start() | Out-Null
+    $stderrTask = $p.StandardError.ReadToEndAsync()
+
+    if (-not $p.WaitForExit(15000)) {
+      try { $p.Kill() } catch { }
+      try { $p.WaitForExit(2000) } catch { }
+      Write-ParallelLog -Message "CUDA AV1 decode capability probe timed out; treating as unsupported." -Level Warning -Target Both -JobId $JobId
+      return $false
+    }
+
+    if ($p.ExitCode -eq 0) {
+      Write-ParallelLog -Message "CUDA AV1 decode capability probe succeeded; AV1 tests may keep CUDA decode variants." -Target Both -JobId $JobId
+      return $true
+    }
+
+    $err = ""
+    try { $err = $stderrTask.GetAwaiter().GetResult().Trim() }
+    catch { $err = "" }
+    $firstLine = if ([string]::IsNullOrWhiteSpace($err)) { 'Unknown ffmpeg error' }
+    else { ($err -split "`r?`n" | Select-Object -First 1).Trim() }
+
+    Write-ParallelLog -Message "CUDA AV1 decode capability probe failed; AV1 tests will skip CUDA decode variants. Reason: $firstLine" -Level Warning -Target Both -JobId $JobId
+    return $false
+  }
+  catch {
+    Write-ParallelLog -Message "CUDA AV1 decode capability probe exception; treating as unsupported. $($_.Exception.Message)" -Level Warning -Target Both -JobId $JobId
+    return $false
+  }
+  finally {
+    try { $p.Dispose() } catch { }
+  }
 }
 
 function Write-ParallelLog {
@@ -2051,8 +2328,7 @@ function Invoke-QueuedArrRefreshes {
   }
 }
 
-function Start-EncodeProcess {
-  [CmdletBinding(SupportsShouldProcess = $true)]
+function Start-TestProcess {
   param(
     [int]$JobId,
     [psobject]$JobState
@@ -2060,7 +2336,6 @@ function Start-EncodeProcess {
 
   $item = $JobState.Item
   $probe = $JobState.Probe
-  $durationMs = $JobState.DurationMs
 
   if ($script:CancellationToken.IsCancellationRequested -or $script:StopRequested) {
     $JobState.State = "Skipped"
@@ -2069,7 +2344,12 @@ function Start-EncodeProcess {
   }
 
   $primaryVideoStream = @($probe.streams | Where-Object { $_.codec_type -ieq 'video' } | Select-Object -First 1)
-  if (-not $primaryVideoStream) { throw "No video stream found for '$($item.FullName)'." }
+  if (-not $primaryVideoStream) {
+    $JobState.State = "Failed"
+    $JobState.Error = "No video stream found for '$($item.FullName)'."
+    Write-ParallelLog -Message $JobState.Error -Level Error -Target Both -JobId $JobId
+    return
+  }
 
   $analysis = $JobState.Analysis
   $audioMap = $analysis.AudioMap
@@ -2086,7 +2366,13 @@ function Start-EncodeProcess {
   $progressTarget = "$($JobState.ProgressFile)"
   if ([string]::IsNullOrWhiteSpace($progressTarget)) { $progressTarget = "pipe:1" }
 
-  if (-not $script:HWProfile) { throw "Hardware profile is not initialized." }
+  if (-not $script:HWProfile) {
+    $JobState.State = "Failed"
+    $JobState.Error = "Hardware profile is not initialized."
+    Write-ParallelLog -Message $JobState.Error -Level Error -Target Both -JobId $JobId
+    return
+  }
+
   $hwProfile = $script:HWProfile
   $hwaccelArgs = ''
   if (-not [string]::IsNullOrWhiteSpace($hwProfile.HwaccelArgs)) {
@@ -2094,7 +2380,10 @@ function Start-EncodeProcess {
   }
   $codecArgs = & $hwProfile.CodecArgs $script:CQPRateControlInt $bitrateArg
 
-  $ffmpegArgs = "-hide_banner -y -threads 0 ${hwaccelArgs}-copy_unknown -analyzeduration 4GB -probesize 4GB "
+  $encodeProbeArgs = "-analyzeduration 4GB -probesize 4GB"
+  $testProbeArgs = "-analyzeduration $($script:TestProbeAnalyzeDuration) -probesize $($script:TestProbeSize)"
+
+  $ffmpegArgs = "-hide_banner -y -threads 0 ${hwaccelArgs}-copy_unknown $encodeProbeArgs "
   $ffmpegArgs += "-nostats -stats_period 0.25 -progress `"$progressTarget`" -i `"$($item.FullName)`" "
   $ffmpegArgs += "$scaleArg -default_mode infer_no_subs -map 0:v:0 $audioMap $subMap $audioDisp $subDisp -dn -map_metadata 0 -map_chapters 0 "
   $ffmpegArgs += "-c:v $($hwProfile.Encoder) -c:a copy -c:s copy "
@@ -2102,7 +2391,102 @@ function Start-EncodeProcess {
   $ffmpegArgs += "-max_interleave_delta 500000 "
   $ffmpegArgs += "`"$($JobState.OutputFile)`""
 
-  $ffmpegArgs = Invoke-EncodeTestWithFallback -FFmpegArgs $ffmpegArgs -OutputFile $JobState.OutputFile -JobId $JobId
+  # Keep tests intentionally narrow: first video stream only, no audio/subtitles/data,
+  # and a small fixed frame sample to validate encoder/hw options quickly.
+  $testArgs = "-hide_banner -y -threads 0 ${hwaccelArgs}-copy_unknown $testProbeArgs "
+  $testArgs += "-i `"$($item.FullName)`" "
+  $testArgs += "$scaleArg -map 0:v:0 -an -sn -dn -map_metadata -1 -map_chapters -1 "
+  $testArgs += "-c:v $($hwProfile.Encoder) "
+  $testArgs += $codecArgs
+  $testArgs += "-frames:v $($script:TestFrameCount) -f null $($script:NullDevice)"
+  $fallbackSteps = @($hwProfile.FallbackChain)
+
+  $sourceCodec = ''
+  if ($analysis.PrimaryVideo -and $analysis.PrimaryVideo.codec_name) {
+    $sourceCodec = "$($analysis.PrimaryVideo.codec_name)".Trim().ToLowerInvariant()
+  }
+
+  if (($sourceCodec -eq 'av1') -and ($hwProfile.Name -eq 'nvenc') -and (-not $script:CudaAv1DecodeSupportKnown)) {
+    $script:CudaAv1DecodeSupported = Test-CudaAv1DecodeSupport -InputPath $item.FullName -JobId $JobId
+    $script:CudaAv1DecodeSupportKnown = $true
+  }
+
+  # Heuristic: AV1 sources are a poor fit for initial CUDA hwaccel test variants on some systems.
+  # Skip those test-chain entries and begin at a safer fallback so the capability check reflects
+  # whether the final encode settings work, not whether AV1 CUDA decode startup is slow/failing.
+  if (($sourceCodec -eq 'av1') -and ($hwProfile.Name -eq 'nvenc') -and (-not $script:CudaAv1DecodeSupported)) {
+    $skippedCudaTestVariants = 0
+    while (($testArgs -match '(?i)-hwaccel\s+cuda\b') -and ($fallbackSteps.Count -gt 0)) {
+      $testArgs = & $fallbackSteps[0] $testArgs
+      $ffmpegArgs = & $fallbackSteps[0] $ffmpegArgs
+      $skippedCudaTestVariants++
+
+      if ($fallbackSteps.Count -gt 1) {
+        $fallbackSteps = @($fallbackSteps[1..($fallbackSteps.Count - 1)])
+      }
+      else {
+        $fallbackSteps = @()
+      }
+    }
+
+    if ($skippedCudaTestVariants -gt 0) {
+      Write-ParallelLog -Message "AV1 heuristic: skipped $skippedCudaTestVariants CUDA decode test variant(s); starting test chain at a safer fallback." -Target Both -JobId $JobId
+    }
+  }
+
+  $maxAttempts = [Math]::Max(1, $fallbackSteps.Count + 1)
+
+  $JobState.TestFullArgs      = $ffmpegArgs
+  $JobState.TestArgs          = $testArgs
+  $JobState.TestAttempt       = 1
+  $JobState.TestMaxAttempts   = $maxAttempts
+  $JobState.TestFallbackSteps = $fallbackSteps
+
+  Invoke-StartTestAttempt -JobId $JobId -JobState $JobState
+}
+
+function Invoke-StartTestAttempt {
+  param(
+    [int]$JobId,
+    [psobject]$JobState
+  )
+
+  Write-VerboseParallelLog -Message "Running ffmpeg test attempt $($JobState.TestAttempt)/$($JobState.TestMaxAttempts) ($($script:HWProfile.Name)) with args: $($JobState.TestArgs)" -JobId $JobId
+
+  $p = New-Object System.Diagnostics.Process
+  $p.StartInfo.FileName = $script:ffmpeg_exe
+  $p.StartInfo.Arguments = $JobState.TestArgs
+  $p.StartInfo.UseShellExecute = $false
+  $p.StartInfo.RedirectStandardOutput = $false
+  $p.StartInfo.RedirectStandardError = $true
+  $p.StartInfo.CreateNoWindow = $true
+
+  $p.Start() | Out-Null
+  Register-ChildProcess -Process $p -JobId $JobId
+  $JobState.TestProcess    = $p
+  $JobState.TestStderrTask = $p.StandardError.ReadToEndAsync()
+  $JobState.State          = "Testing"
+  $JobState.Status         = "Testing ($($JobState.TestAttempt)/$($JobState.TestMaxAttempts))..."
+}
+
+function Start-EncodeProcess {
+  [CmdletBinding(SupportsShouldProcess = $true)]
+  param(
+    [int]$JobId,
+    [psobject]$JobState,
+    [Parameter(Mandatory = $true)][string]$EffectiveArgs
+  )
+
+  $item = $JobState.Item
+  $durationMs = $JobState.DurationMs
+
+  if ($script:CancellationToken.IsCancellationRequested -or $script:StopRequested) {
+    $JobState.State = "Skipped"
+    $JobState.Status = "Canceled"
+    return
+  }
+
+  $ffmpegArgs = $EffectiveArgs
   Write-VerboseParallelLog -Message "Launching ffmpeg with args: $ffmpegArgs" -JobId $JobId
 
   if ($script:ShowOutputCmdEnabled) {
@@ -2121,6 +2505,7 @@ function Start-EncodeProcess {
 
   $started = $p.Start()
   if (-not $started) { throw "Failed to start ffmpeg process for $($item.FullName)" }
+  Register-ChildProcess -Process $p -JobId $JobId
 
   $JobState.Process = $p
   $JobState.Started = Get-Date
@@ -2154,6 +2539,67 @@ function Update-ProgressState {
   param([hashtable]$StateTable)
 
   if (-not $PSCmdlet.ShouldProcess("Job state table", "Update ffmpeg progress state")) { return }
+
+  # Poll jobs in the "Testing" state — asynchronously started test processes.
+  foreach ($k in @($StateTable.Keys)) {
+    $job = $StateTable[$k]
+    if (-not $job) { continue }
+    if ($job.State -ne "Testing") { continue }
+
+    # TestProcess null means we are waiting out the retry backoff delay.
+    if (-not $job.TestProcess) {
+      if ((Get-Date) -ge $job.TestRetryAfter) {
+        Invoke-StartTestAttempt -JobId $k -JobState $job
+      }
+      continue
+    }
+
+    if (-not $job.TestProcess.HasExited) { continue }
+
+    $exitCode = $job.TestProcess.ExitCode
+    $job.TestProcess = $null
+
+    if ($exitCode -eq 0) {
+      $effectiveArgs = $job.TestFullArgs
+      Write-VerboseParallelLog -Message "ffmpeg test succeeded; effective encode args selected." -JobId $k
+      Write-VerboseParallelLog -Message "Effective ffmpeg args: $effectiveArgs" -JobId $k
+      $job.TestStderrTask = $null
+      Start-EncodeProcess -JobId $k -JobState $job -EffectiveArgs $effectiveArgs
+      continue
+    }
+
+    $err = ""
+    try { $err = $job.TestStderrTask.GetAwaiter().GetResult().Trim() }
+    catch { $err = "" }
+    $job.TestStderrTask = $null
+    $errSummary = "Unknown ffmpeg test error"
+    if (-not [string]::IsNullOrWhiteSpace($err)) { $errSummary = ($err -split "`r?`n")[0].Trim() }
+
+    Write-ParallelLog -Message "Test command failed (attempt $($job.TestAttempt)/$($job.TestMaxAttempts)): $errSummary" -Level Warning -Target Both -JobId $k
+
+    $fallbackIndex = $job.TestAttempt - 1
+    if ($fallbackIndex -ge $job.TestFallbackSteps.Count) {
+      $job.State = "Failed"
+      $job.Status = "Failed (test exhausted)"
+      $job.Error = "ffmpeg test command failed after $($job.TestMaxAttempts) attempts for encoder '$($script:HWProfile.Name)'."
+      Write-ParallelLog -Message $job.Error -Level Error -Target Both -JobId $k
+      continue
+    }
+
+    try {
+      $job.TestArgs = & $job.TestFallbackSteps[$fallbackIndex] $job.TestArgs
+      $job.TestFullArgs = & $job.TestFallbackSteps[$fallbackIndex] $job.TestFullArgs
+      Write-ParallelLog -Message "Applying fallback step $($fallbackIndex + 1)/$($job.TestFallbackSteps.Count) for encoder '$($script:HWProfile.Name)'." -Level Warning -Target Both -JobId $k
+    }
+    catch {
+      Write-ParallelLog -Message "Fallback step $($fallbackIndex + 1) failed: $($_.Exception.Message)" -Level Warning -Target Both -JobId $k
+    }
+
+    $sleepSec = [Math]::Pow(2, $job.TestAttempt)
+    $job.TestRetryAfter = (Get-Date).AddSeconds($sleepSec)
+    $job.TestAttempt++
+    # TestProcess stays null; next tick will start the next attempt once delay elapses.
+  }
 
   # Only the host loop mutates terminal job states; workers update process/progress artifacts.
   foreach ($k in @($StateTable.Keys)) {
@@ -2298,7 +2744,7 @@ function Show-ParallelProgress {
   param([hashtable]$StateTable, [int]$TotalCount)
 
   $completed = @($StateTable.Values | Where-Object { $_.State -in @("Completed", "Failed", "Skipped") }).Count
-  $running = @($StateTable.Values | Where-Object { $_.State -eq "Running" }).Count
+  $running = @($StateTable.Values | Where-Object { $_.State -in @("Running", "Testing") }).Count
   $scanned = [Math]::Min($TotalCount, [Math]::Max(0, $script:ScanProcessedCount))
   $scanPercent = if ($TotalCount -gt 0) { [Math]::Min(100, [int](($scanned / [decimal]$TotalCount) * 100.0)) }
   else { 0 }
@@ -2352,6 +2798,7 @@ function Show-ParallelProgress {
 
     $activity = "Loading:   "
     switch ($job.State) {
+      'Testing' { $activity = "Testing    [$pulse]:" }
       'Running' { $activity = "Processing [$pulse]:" }
       'Failed' { $activity = 'Failed:    ' }
       'Skipped' { $activity = 'Skipped:   ' }
@@ -2625,6 +3072,14 @@ function Get-QueuedWorkItem {
     PreviousProgress     = 0.0
     ProgressDiagLogged   = $false
     ProgressDumpWriter   = $null
+    TestProcess          = $null
+    TestStderrTask       = $null
+    TestArgs             = ""
+    TestFullArgs         = ""
+    TestAttempt          = 0
+    TestMaxAttempts      = 0
+    TestFallbackSteps    = @()
+    TestRetryAfter       = [DateTime]::MinValue
 
   }
 
@@ -2676,8 +3131,9 @@ function Stop-ParallelExecution {
   }
 
   if ($StateTable) {
-    # Running processes are terminated best-effort; final state is reconciled in the host loop.
-    foreach ($active in @($StateTable.Values | Where-Object { $_.State -eq 'Running' })) {
+    # Running and Testing processes are terminated best-effort; final state is reconciled in the host loop.
+    foreach ($active in @($StateTable.Values | Where-Object { $_.State -in @('Running', 'Testing') })) {
+      # Kill encode process (Running state).
       if ($active.Process -and (-not $active.Process.HasExited)) {
         $killed = $false
         try { $active.Process.Kill(); $killed = $true }
@@ -2692,6 +3148,14 @@ function Stop-ParallelExecution {
           }
           $active.Status = "Canceled"
         }
+      }
+
+      # Kill test process (Testing state).
+      if ($active.TestProcess -and (-not $active.TestProcess.HasExited)) {
+        try { $active.TestProcess.Kill() } catch { }
+        try { $active.TestProcess.WaitForExit(5000) } catch { }
+        $active.TestProcess = $null
+        $active.Status = "Canceled"
       }
     }
   }
@@ -2722,8 +3186,8 @@ function Register-CancellationHandler {
 
       # Best-effort process cleanup for host close/abort scenarios.
       if ($script:StateTableRef) {
-        foreach ($active in @($script:StateTableRef.Values | Where-Object { $_ -and $_.Process -and ($_.State -eq 'Running') })) {
-          if (-not $active.Process.HasExited) {
+        foreach ($active in @($script:StateTableRef.Values | Where-Object { $_ -and ($_.State -in @('Running', 'Testing')) })) {
+          if ($active.Process -and (-not $active.Process.HasExited)) {
             $killed = $false
             try { $active.Process.Kill(); $killed = $true }
             catch {
@@ -2736,6 +3200,11 @@ function Register-CancellationHandler {
                 Write-VerboseParallelLog -Message "Exception while waiting for ffmpeg process to exit: $($_.Exception.Message)" -JobId $active.Id
               }
             }
+          }
+
+          if ($active.TestProcess -and (-not $active.TestProcess.HasExited)) {
+            try { $active.TestProcess.Kill() } catch { }
+            try { $active.TestProcess.WaitForExit(5000) } catch { }
           }
         }
       }
@@ -2785,6 +3254,8 @@ $pending = $null
 $candidates = $null
 $canceledPendingCount = 0
 $runStarted = Get-Date
+Initialize-ChildProcessContainment
+Start-ChildProcessWatchdog
 Register-CancellationHandler
 
 # Clean up old log files (main logs and progress dumps).
@@ -3014,7 +3485,7 @@ try {
     return
   }
 
-  while (($candidates.Count -gt 0) -or ($pending.Count -gt 0) -or (@($sync.Values | Where-Object { $_.State -eq 'Running' }).Count -gt 0)) {
+  while (($candidates.Count -gt 0) -or ($pending.Count -gt 0) -or (@($sync.Values | Where-Object { $_.State -in @('Running', 'Testing') }).Count -gt 0)) {
     if ($script:CancellationToken.IsCancellationRequested -and (-not $script:StopRequested)) {
       $canceledPendingCount += Stop-ParallelExecution -StateTable $sync -PendingQueue $pending -CandidateQueue $candidates -Reason "Cancellation requested"
     }
@@ -3022,7 +3493,7 @@ try {
     if ($script:StopRequested) { break }
 
     # Only triage when we need to refill capacity. Avoid ffprobe blocking while all encoders are busy.
-    $runningBeforeTriage = @($sync.Values | Where-Object { $_.State -eq 'Running' }).Count
+    $runningBeforeTriage = @($sync.Values | Where-Object { $_.State -in @('Running', 'Testing') }).Count
     $needRefill = (($runningBeforeTriage + $pending.Count) -lt $MaxParallelJobs)
     $triageBudget = if ($runningBeforeTriage -gt 0) { 2 }
     else { [Math]::Max(6, ($MaxParallelJobs * 3)) }
@@ -3040,16 +3511,16 @@ try {
       }
 
       $triagedThisTick++
-      $needRefill = (($runningBeforeTriage + $pending.Count) -lt $MaxParallelJobs)
+      $needRefill = (($runningBeforeTriage + $pending.Count) -lt $MaxParallelJobs)  # runningBeforeTriage includes Testing
     }
 
-    # Admission control: never exceed MaxParallelJobs active encodes.
-    while ((@($sync.Values | Where-Object { $_.State -eq 'Running' }).Count -lt $MaxParallelJobs) -and ($pending.Count -gt 0)) {
+    # Admission control: never exceed MaxParallelJobs active (Testing + Running) slots.
+    while ((@($sync.Values | Where-Object { $_.State -in @('Running', 'Testing') }).Count -lt $MaxParallelJobs) -and ($pending.Count -gt 0)) {
       if ($script:StopRequested -or $script:CancellationToken.IsCancellationRequested) { break }
 
       $work = $pending.Dequeue()
       $sync[$work.Id] = $work
-      Start-EncodeProcess -JobId $work.Id -JobState $sync[$work.Id]
+      Start-TestProcess -JobId $work.Id -JobState $sync[$work.Id]
     }
 
     Update-ProgressState -StateTable $sync
@@ -3059,13 +3530,13 @@ try {
       $now = Get-Date
       if (($now - $script:LastVerboseSnapshot).TotalSeconds -ge 5.0) {
         $script:LastVerboseSnapshot = $now
-        $runningCount = @($sync.Values | Where-Object { $_.State -eq 'Running' }).Count
+        $runningCount = @($sync.Values | Where-Object { $_.State -in @('Running', 'Testing') }).Count
         $completedCount = @($sync.Values | Where-Object { $_.State -in @('Completed', 'Failed', 'Skipped') }).Count
         $pendingCount = $pending.Count + $candidates.Count
         $jobProgressParts = @()
         foreach ($jk in @($sync.Keys | Sort-Object)) {
           $jv = $sync[$jk]
-          if ($jv -and ($jv.State -eq 'Running')) {
+          if ($jv -and ($jv.State -in @('Running', 'Testing'))) {
             $hasTask = ($null -ne $jv.ProgressReadTask)
             $taskDone = ($hasTask -and $jv.ProgressReadTask.IsCompleted)
             $jobProgressParts += "J$jk=$($jv.Percent)%/spd=$($jv.Speed)/task=$hasTask/done=$taskDone"
@@ -3142,8 +3613,8 @@ catch {
 finally {
   # Ctrl+C may bypass the normal scheduler shutdown path; enforce child-process cleanup here.
   if ($sync) {
-    foreach ($active in @($sync.Values | Where-Object { $_ -and $_.Process -and ($_.State -eq 'Running') })) {
-      if (-not $active.Process.HasExited) {
+    foreach ($active in @($sync.Values | Where-Object { $_ -and ($_.State -in @('Running', 'Testing')) })) {
+      if ($active.Process -and (-not $active.Process.HasExited)) {
         $killed = $false
         try { $active.Process.Kill(); $killed = $true }
         catch {
@@ -3159,6 +3630,22 @@ finally {
           $active.Status = 'Canceled'
         }
       }
+
+      if ($active.TestProcess -and (-not $active.TestProcess.HasExited)) {
+        $testKilled = $false
+        try { $active.TestProcess.Kill(); $testKilled = $true }
+        catch {
+          Write-VerboseParallelLog -Message "Final cleanup could not stop ffmpeg test process: $($_.Exception.Message)"
+        }
+
+        if ($testKilled) {
+          try { $active.TestProcess.WaitForExit(5000) } catch { }
+          $active.TestProcess = $null
+          $active.State = 'Skipped'
+          $active.Status = 'Canceled'
+        }
+      }
+
       if ($active.ProgressDumpWriter) {
         try {
           $active.ProgressDumpWriter.WriteLine("# --- Cleanup at $(Get-Date -Format 'o')")
@@ -3238,6 +3725,27 @@ finally {
 
   if ($script:ArrRefreshTargets) {
     $script:ArrRefreshTargets.Clear()
+  }
+
+  if ($script:ChildWatchdogProcess -and (-not $script:ChildWatchdogProcess.HasExited)) {
+    try { Stop-Process -Id $script:ChildWatchdogProcess.Id -Force -ErrorAction SilentlyContinue }
+    catch {
+      Write-VerboseParallelLog -Message "Unable to stop child process watchdog cleanly: $($_.Exception.Message)"
+    }
+    finally {
+      $script:ChildWatchdogProcess = $null
+    }
+  }
+
+  if ($script:ProcessJobHandle -ne [IntPtr]::Zero) {
+    try { [void][FfmpegH265.JobObjectNative]::CloseHandle($script:ProcessJobHandle) }
+    catch {
+      Write-VerboseParallelLog -Message "Unable to close process containment job handle cleanly: $($_.Exception.Message)"
+    }
+    finally {
+      $script:ProcessJobHandle = [IntPtr]::Zero
+      $script:ProcessJobEnabled = $false
+    }
   }
 
   if ($script:LogMutex) {
