@@ -1,4 +1,4 @@
-# FFmpeg NVENC H.265 Parallel Encoder
+# FFmpeg H.265 Parallel Encoder
 
 A PowerShell script for high-performance, parallel video transcoding using FFmpeg hardware acceleration (NVENC, AMF, QSV) with software fallback. This script is designed to efficiently convert large video libraries to H.265 (HEVC) format with support for concurrent processing, progress tracking, and media server integration.
 
