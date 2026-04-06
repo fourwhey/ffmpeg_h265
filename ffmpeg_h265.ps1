@@ -5,6 +5,86 @@
   Discovers files, precomputes encode work items, and runs up to -MaxParallelJobs ffmpeg
   processes concurrently. Uses a synchronized hashtable for progress state and renders
   a parent + per-job Write-Progress display. Logging is job-scoped and thread-safe.
+.PARAMETER Path
+  Required for encode and -Analyze runs; optional for -Compact and standalone -ViewReport
+.PARAMETER MaxParallelJobs
+  Maximum number of concurrent encoding jobs (1-4). Values above 4 are clamped to 4.
+.PARAMETER ShowOutputCmd
+  Display FFmpeg commands being executed
+.PARAMETER NoProgress
+  Disable progress bars
+.PARAMETER ResizeResolution
+  Target resolution (e.g., "1920:1080")
+.PARAMETER ForceResize
+  Force resize even if already at target resolution
+.PARAMETER RetainAspect
+  Maintain aspect ratio when resizing
+.PARAMETER CanScaleUp
+  Allow upscaling videos
+.PARAMETER CanScaleDown
+  Allow downscaling videos
+.PARAMETER CQPRateControl
+  Constant Quality (CQP) value (lower = higher quality, 18-32 typical)
+.PARAMETER BitrateControl
+  Target bitrate (e.g., "6M" for 6 Mbps) instead of CQP
+.PARAMETER ForceConvert
+  Re-encode files already in H.265 format
+.PARAMETER CanReprocess
+  Allow reprocessing of previously completed files
+.PARAMETER SkipMoveOnCompletion
+  Don't move files to processed folder after conversion
+.PARAMETER SkipArrRefresh
+  Skip Radarr/Sonarr refresh after completion
+.PARAMETER LogEnabled
+  Enable file logging
+.PARAMETER LogVerbose
+  Enable verbose logging
+.PARAMETER ExitOnError
+  Stop all processing if any job fails
+.PARAMETER SortExpression
+  Sort order for processing files
+.PARAMETER UserFilter
+  Custom filter for selecting files
+.PARAMETER AudioLang
+  ISO 639-2 audio language codes to keep; supports one or many values
+.PARAMETER SubLang
+  ISO 639-2 subtitle language codes to keep; supports one or many values
+.PARAMETER LastRunDate
+  Only process files modified after this date
+.PARAMETER SkipFileLock
+  Skip file lock check (process files even if in use)
+.PARAMETER ConfigPath
+  Directory containing ffmpeg_h265.config.json (overrides auto-discovery for encode/analyze/compact modes)
+.PARAMETER LogPath
+  Log output path override for the current run (accepts directory or full log file path; takes precedence over FFENC_LOG_PATH and config log_path)
+.PARAMETER Encoder
+  Encoder profile: auto, nvenc, amf, qsv, software
+.PARAMETER Analyze
+  Analyze metadata and generate report files without encoding
+.PARAMETER ViewReport
+  Launch report viewer helper (serve_report.ps1 -Report runtime) and open the runtime report; when used alone it does not require -Path or config loading
+.PARAMETER HashAlgorithm
+  Analyze hash strategy: size-mtime (fastest, default) or crc32 using the script's built-in CRC32 implementation
+.PARAMETER Compact
+  Compact existing metadata report data (remove deleted files)
+.EXAMPLE
+  .\ffmpeg_h265.ps1 -Path "V:\Media\TV Shows"
+  Convert all video files in a directory using default settings.
+.EXAMPLE
+  .\ffmpeg_h265.ps1 -Path "V:\Media\Movies" -MaxParallelJobs 4 -CQPRateControl 26
+  Converts movies with 4 parallel jobs and CQP quality level 26 (lower = higher quality).
+.EXAMPLE
+  .\ffmpeg_h265.ps1 -Path "V:\Videos" -ResizeResolution "1920:1080" -RetainAspect -CanScaleDown
+  Resizes videos to 1080p, maintaining aspect ratio, only if the source is larger than 1080p.
+.EXAMPLE
+  .\ffmpeg_h265.ps1 -Path "V:\Media\TV Shows" -BitrateControl "6M" -ForceConvert -MaxParallelJobs 2
+  Forces re-encoding using 6 Mbps bitrate limit, even if files are already H.265 encoded.
+.EXAMPLE
+  .\ffmpeg_h265.ps1 -Path "Z:\Movies" -Analyze
+  Analyze metadata and generate report files without encoding.
+.EXAMPLE
+  .\ffmpeg_h265.ps1 -ViewReport
+  Launch report viewer and open the runtime report without requiring -Path or config.
 #>
 
 param(
@@ -36,6 +116,7 @@ param(
   [Parameter(Mandatory = $false)][datetime] $LastRunDate,
   [Parameter(Mandatory = $false)][switch] $SkipFileLock = $false,
   [Parameter(Mandatory = $false, HelpMessage = "Directory containing the .config.json file")][string] $ConfigPath = "",
+  [Parameter(Mandatory = $false, HelpMessage = "Directory where log files will be stored")][string] $LogPath = "",
   [Parameter(Mandatory = $false, HelpMessage = "Hardware encoder profile: auto, nvenc, amf, qsv, software")][ValidateSet('auto', 'nvenc', 'amf', 'qsv', 'software')][string] $Encoder = 'auto',
   [Parameter(Mandatory = $false)][switch] $Analyze,
   [Parameter(Mandatory = $false)][switch] $ViewReport,
@@ -86,6 +167,84 @@ if ($PSVersionTable.PSVersion -lt [version]'7.5.0') {
   throw "This script requires PowerShell 7.5 or newer. Current version: $($PSVersionTable.PSVersion)"
 }
 
+function Initialize-Crc32Support {
+  [CmdletBinding()]
+  param()
+
+  if (([System.Management.Automation.PSTypeName]'ffmpegH265.Crc32Calculator').Type) {
+    return
+  }
+
+  Add-Type -TypeDefinition @"
+using System;
+using System.IO;
+
+namespace ffmpegH265 {
+  public static class Crc32Calculator {
+    private static readonly uint[] Table = CreateTable();
+
+    public static uint Compute(byte[] bytes) {
+      if (bytes == null) {
+        throw new ArgumentNullException(nameof(bytes));
+      }
+
+      return Append(0u, bytes, 0, bytes.Length);
+    }
+
+    public static uint ComputeFromFile(string filePath) {
+      if (string.IsNullOrWhiteSpace(filePath)) {
+        throw new ArgumentException("File path must not be empty.", nameof(filePath));
+      }
+
+      using var stream = File.OpenRead(filePath);
+      var buffer = new byte[65536];
+      uint crc = 0u;
+      int read;
+      while ((read = stream.Read(buffer, 0, buffer.Length)) > 0) {
+        crc = Append(crc, buffer, 0, read);
+      }
+
+      return crc;
+    }
+
+    private static uint Append(uint currentCrc, byte[] buffer, int offset, int count) {
+      var crc = ~currentCrc;
+      var end = offset + count;
+
+      for (var index = offset; index < end; index++) {
+        crc = (crc >> 8) ^ Table[(crc ^ buffer[index]) & 0xFFu];
+      }
+
+      return ~crc;
+    }
+
+    private static uint[] CreateTable() {
+      const uint polynomial = 0xEDB88320u;
+      var table = new uint[256];
+
+      for (uint index = 0; index < table.Length; index++) {
+        uint entry = index;
+        for (var bit = 0; bit < 8; bit++) {
+          if ((entry & 1u) != 0u) {
+            entry = (entry >> 1) ^ polynomial;
+          }
+          else {
+            entry >>= 1;
+          }
+        }
+
+        table[index] = entry;
+      }
+
+      return table;
+    }
+  }
+}
+"@
+}
+
+Initialize-Crc32Support
+
 function Initialize-ChildProcessContainment {
   [CmdletBinding()]
   param()
@@ -94,12 +253,12 @@ function Initialize-ChildProcessContainment {
   if ($script:ProcessJobEnabled) { return }
 
   try {
-    if (-not ([System.Management.Automation.PSTypeName]'FfmpegH265.JobObjectNative').Type) {
+    if (-not ([System.Management.Automation.PSTypeName]'ffmpegH265.JobObjectNative').Type) {
       Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
 
-namespace FfmpegH265 {
+namespace ffmpegH265 {
   [Flags]
   public enum JobObjectLimitFlags : uint {
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
@@ -157,23 +316,23 @@ namespace FfmpegH265 {
 "@ -Language CSharp -ErrorAction Stop
     }
 
-    $jobHandle = [FfmpegH265.JobObjectNative]::CreateJobObject([IntPtr]::Zero, $null)
+    $jobHandle = [ffmpegH265.JobObjectNative]::CreateJobObject([IntPtr]::Zero, $null)
     if ($jobHandle -eq [IntPtr]::Zero) {
       Write-VerboseParallelLog -Message "Process containment unavailable: CreateJobObject failed (Win32=$([Runtime.InteropServices.Marshal]::GetLastWin32Error()))."
       return
     }
 
-    $limitInfo = [FfmpegH265.JOBOBJECT_EXTENDED_LIMIT_INFORMATION]::new()
-    $limitInfo.BasicLimitInformation.LimitFlags = [uint32][FfmpegH265.JobObjectLimitFlags]::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    $limitInfo = [ffmpegH265.JOBOBJECT_EXTENDED_LIMIT_INFORMATION]::new()
+    $limitInfo.BasicLimitInformation.LimitFlags = [uint32][ffmpegH265.JobObjectLimitFlags]::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 
-    $size = [Runtime.InteropServices.Marshal]::SizeOf([type][FfmpegH265.JOBOBJECT_EXTENDED_LIMIT_INFORMATION])
+    $size = [Runtime.InteropServices.Marshal]::SizeOf([type][ffmpegH265.JOBOBJECT_EXTENDED_LIMIT_INFORMATION])
     $ptr = [Runtime.InteropServices.Marshal]::AllocHGlobal($size)
     try {
       [Runtime.InteropServices.Marshal]::StructureToPtr($limitInfo, $ptr, $false)
-      $ok = [FfmpegH265.JobObjectNative]::SetInformationJobObject($jobHandle, [FfmpegH265.JobObjectNative]::JobObjectExtendedLimitInformation, $ptr, [uint32]$size)
+      $ok = [ffmpegH265.JobObjectNative]::SetInformationJobObject($jobHandle, [ffmpegH265.JobObjectNative]::JobObjectExtendedLimitInformation, $ptr, [uint32]$size)
       if (-not $ok) {
         $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-        [void][FfmpegH265.JobObjectNative]::CloseHandle($jobHandle)
+        [void][ffmpegH265.JobObjectNative]::CloseHandle($jobHandle)
         Write-VerboseParallelLog -Message "Process containment unavailable: SetInformationJobObject failed (Win32=$err)."
         return
       }
@@ -208,7 +367,7 @@ function Register-ChildProcess {
   if ($script:ProcessJobAssignFailed) { return }
 
   try {
-    $assigned = [FfmpegH265.JobObjectNative]::AssignProcessToJobObject($script:ProcessJobHandle, $Process.Handle)
+    $assigned = [ffmpegH265.JobObjectNative]::AssignProcessToJobObject($script:ProcessJobHandle, $Process.Handle)
     if (-not $assigned) {
       $script:ProcessJobAssignFailed = $true
       $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
@@ -364,6 +523,11 @@ if (-not $script:ScriptRoot) {
 # When invoked via a symlink, $PSScriptRoot resolves to the target directory.
 # Capture the symlink's own directory so config discovery finds files placed beside it.
 $script:InvokedScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Source
+$script:InvokedScriptPath = $MyInvocation.MyCommand.Source
+# Keep a normalized script path for process ownership checks in queue lock recovery.
+if ([string]::IsNullOrWhiteSpace($script:InvokedScriptPath)) {
+  $script:InvokedScriptPath = $MyInvocation.MyCommand.Path
+}
 # Derive config filename from the invoked script name (e.g. foo.ps1 -> foo.config.json).
 $invokedScriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Source)
 if ([string]::IsNullOrWhiteSpace($invokedScriptName)) {
@@ -392,6 +556,7 @@ $script:logFilePath = $null
 $script:LogMutexName = if ($IsWindows) { "Global\${script:LogPrefix}_log" }
 else { "${script:LogPrefix}_log" }
 $script:LogMutex = $null
+$script:QueuedFileMutexes = @{}
 $script:ArrRefreshJobs = [System.Collections.Generic.List[object]]::new()
 $script:ArrRefreshJobMeta = @{}
 $script:ArrRefreshRequestedKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -450,7 +615,7 @@ function Resolve-LogPath {
 
   if (-not [string]::IsNullOrWhiteSpace($ExplicitPath)) {
     if ([System.IO.Path]::HasExtension($ExplicitPath) -and
-        -not (Test-Path -LiteralPath $ExplicitPath -PathType Container -ErrorAction SilentlyContinue)) {
+      -not (Test-Path -LiteralPath $ExplicitPath -PathType Container -ErrorAction SilentlyContinue)) {
       # Full file path (e.g. C:\logs\my_log.log) — use as the log file directly.
       $prefix = [System.IO.Path]::GetFileNameWithoutExtension($ExplicitPath)
       return @{
@@ -473,7 +638,8 @@ function Resolve-LogPath {
   $dir = $PWD.Path
   if (-not [string]::IsNullOrWhiteSpace($LoadedConfigDirectory)) {
     $dir = $LoadedConfigDirectory
-  } else {
+  }
+  else {
     foreach ($location in $SearchLocations) {
       if ([string]::IsNullOrWhiteSpace($location)) { continue }
       if (Test-Path -LiteralPath $location -PathType Container -ErrorAction SilentlyContinue) {
@@ -488,6 +654,291 @@ function Resolve-LogPath {
     FilePath  = Join-Path $dir $DefaultFileName
     Prefix    = $DefaultPrefix
   }
+}
+
+function Get-Crc32HexFromBytes {
+  param(
+    [Parameter(Mandatory = $true)][byte[]]$Bytes
+  )
+
+  return ('{0:x8}' -f [ffmpegH265.Crc32Calculator]::Compute($Bytes))
+}
+
+function Get-Crc32HexFromFile {
+  param(
+    [Parameter(Mandatory = $true)][string]$FilePath
+  )
+
+  return ('{0:x8}' -f [ffmpegH265.Crc32Calculator]::ComputeFromFile($FilePath))
+}
+
+function Get-QueueLockName {
+  param(
+    [Parameter(Mandatory = $true)][string]$FilePath
+  )
+
+  $hash = Get-QueueLockHashKey -FilePath $FilePath
+
+  if ($IsWindows) {
+    return "Global\ffmpeg_h265_queue_$hash"
+  }
+  return "ffmpeg_h265_queue_$hash"
+}
+
+function Get-QueueLockFilePath {
+  param(
+    [Parameter(Mandatory = $true)][string]$FilePath,
+    [Parameter(Mandatory = $true)][string]$ProcessingRoot
+  )
+
+  $hash = Get-QueueLockHashKey -FilePath $FilePath
+
+  return (Join-Path $ProcessingRoot (".ffmpeg_h265_queue_lock_{0}.json" -f $hash))
+}
+
+function Get-QueueLockHashKey {
+  param(
+    [Parameter(Mandatory = $true)][string]$FilePath
+  )
+
+  $normalized = [System.IO.Path]::GetFullPath($FilePath)
+  if ($IsWindows) { $normalized = $normalized.ToLowerInvariant() }
+
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($normalized)
+  $crcHex = Get-Crc32HexFromBytes -Bytes $bytes
+
+  # Keep names short while reducing accidental collisions beyond raw CRC32.
+  $lengthHex = '{0:x8}' -f $bytes.Length
+  return "$crcHex$lengthHex"
+}
+
+function Register-QueuedFileMutex {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)][string]$FilePath,
+    [Parameter(Mandatory = $true)][string]$ProcessingRoot
+  )
+
+  $lockName = Get-QueueLockName -FilePath $FilePath
+  $lockFilePath = Get-QueueLockFilePath -FilePath $FilePath -ProcessingRoot $ProcessingRoot
+  $mutex = [System.Threading.Mutex]::new($false, $lockName)
+  $acquired = $false
+
+  try {
+    try {
+      $acquired = $mutex.WaitOne(0)
+    }
+    catch [System.Threading.AbandonedMutexException] {
+      $acquired = $true
+    }
+
+    if (-not $acquired) {
+      try { $mutex.Dispose() } catch { }
+      return $null
+    }
+
+    $metadata = [ordered]@{
+      pid             = $PID
+      owner_start_utc = $null
+      script_path     = $script:InvokedScriptPath
+      script_name     = [System.IO.Path]::GetFileName($script:InvokedScriptPath)
+      file_path       = $FilePath
+      lock_name       = $lockName
+      acquired_utc    = (Get-Date).ToUniversalTime().ToString('o')
+    }
+
+    try {
+      $ownerProc = Get-Process -Id $PID -ErrorAction SilentlyContinue
+      if ($ownerProc -and $ownerProc.StartTime) {
+        $metadata.owner_start_utc = $ownerProc.StartTime.ToUniversalTime().ToString('o')
+      }
+    }
+    catch {
+      $metadata.owner_start_utc = $null
+    }
+
+    try {
+      $metadata | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $lockFilePath -Encoding UTF8
+    }
+    catch {
+      Write-VerboseParallelLog -Message "Unable to write queue lock metadata '$lockFilePath': $($_.Exception.Message)"
+    }
+
+    return [PSCustomObject]@{
+      Mutex    = $mutex
+      LockName = $lockName
+      LockFile = $lockFilePath
+    }
+  }
+  catch {
+    if ($acquired) {
+      try { [void]$mutex.ReleaseMutex() } catch { }
+    }
+    try { $mutex.Dispose() } catch { }
+    throw
+  }
+}
+
+function Unregister-QueuedFileMutex {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)][string]$FilePath
+  )
+
+  if (-not $script:QueuedFileMutexes.ContainsKey($FilePath)) { return }
+
+  $entry = $script:QueuedFileMutexes[$FilePath]
+  if (-not $entry) {
+    [void]$script:QueuedFileMutexes.Remove($FilePath)
+    return
+  }
+
+  if ($entry.LockFile -and (Test-Path -LiteralPath $entry.LockFile -PathType Leaf -ErrorAction SilentlyContinue)) {
+    try { Remove-Item -LiteralPath $entry.LockFile -Force -ErrorAction SilentlyContinue }
+    catch {
+      Write-VerboseParallelLog -Message "Unable to remove queue lock metadata '$($entry.LockFile)': $($_.Exception.Message)"
+    }
+  }
+
+  if ($entry.Mutex) {
+    try { [void]$entry.Mutex.ReleaseMutex() } catch { }
+    try { $entry.Mutex.Dispose() } catch { }
+  }
+
+  [void]$script:QueuedFileMutexes.Remove($FilePath)
+}
+
+function Test-QueuedFileMutexHasActiveOwner {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)][string]$LockName
+  )
+
+  if ([string]::IsNullOrWhiteSpace($LockName)) { return $false }
+
+  $mutex = $null
+  $acquired = $false
+  try {
+    $mutex = [System.Threading.Mutex]::new($false, $LockName)
+    try {
+      $acquired = $mutex.WaitOne(0)
+    }
+    catch [System.Threading.AbandonedMutexException] {
+      $acquired = $true
+    }
+
+    return (-not $acquired)
+  }
+  finally {
+    if ($mutex) {
+      if ($acquired) {
+        try { [void]$mutex.ReleaseMutex() } catch { }
+      }
+      try { $mutex.Dispose() } catch { }
+    }
+  }
+}
+
+function Remove-StaleQueuedFileLockMetadata {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)][string]$ProcessingRoot
+  )
+
+  if ([string]::IsNullOrWhiteSpace($ProcessingRoot)) { return }
+  if (-not (Test-Path -LiteralPath $ProcessingRoot -PathType Container -ErrorAction SilentlyContinue)) { return }
+
+  $pattern = Join-Path $ProcessingRoot '.ffmpeg_h265_queue_lock_*.json'
+  $staleFiles = @(Get-ChildItem -Path $pattern -File -ErrorAction SilentlyContinue)
+  if ($staleFiles.Count -eq 0) { return }
+
+  $ownerProcessCache = @{}
+  $removed = 0
+  foreach ($staleFile in $staleFiles) {
+    try {
+      $raw = Get-Content -LiteralPath $staleFile.FullName -Raw -ErrorAction Stop
+      $meta = $raw | ConvertFrom-Json -ErrorAction Stop
+
+      $lockName = [string]$meta.lock_name
+      if (-not [string]::IsNullOrWhiteSpace($lockName)) {
+        if (Test-QueuedFileMutexHasActiveOwner -LockName $lockName) {
+          continue
+        }
+
+        Remove-Item -LiteralPath $staleFile.FullName -Force -ErrorAction SilentlyContinue
+        $removed++
+        continue
+      }
+
+      $ownerPid = 0
+      [void][int]::TryParse("$($meta.pid)", [ref]$ownerPid)
+
+      if ($ownerPid -le 0) {
+        Remove-Item -LiteralPath $staleFile.FullName -Force -ErrorAction SilentlyContinue
+        $removed++
+        continue
+      }
+
+      if (-not $ownerProcessCache.ContainsKey($ownerPid)) {
+        $ownerProcessCache[$ownerPid] = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+      }
+
+      $ownerProc = $ownerProcessCache[$ownerPid]
+      if (-not $ownerProc) {
+        Remove-Item -LiteralPath $staleFile.FullName -Force -ErrorAction SilentlyContinue
+        $removed++
+        continue
+      }
+
+      $ownerIsExpected = $true
+
+      # If PID has been reused by a different process start instance, treat as stale.
+      $recordedStartUtc = [string]$meta.owner_start_utc
+      if (-not [string]::IsNullOrWhiteSpace($recordedStartUtc) -and $ownerProc.StartTime) {
+        try {
+          $recordedStart = [datetime]::Parse($recordedStartUtc).ToUniversalTime()
+          $activeStart = $ownerProc.StartTime.ToUniversalTime()
+          $startDeltaSeconds = [Math]::Abs(($activeStart - $recordedStart).TotalSeconds)
+          if ($startDeltaSeconds -gt 5.0) {
+            $ownerIsExpected = $false
+          }
+        }
+        catch {
+          $ownerIsExpected = $false
+        }
+      }
+
+      if (-not $ownerIsExpected) {
+        Remove-Item -LiteralPath $staleFile.FullName -Force -ErrorAction SilentlyContinue
+        $removed++
+      }
+    }
+    catch {
+      # Corrupt lock metadata should not block startup; remove it.
+      try {
+        Remove-Item -LiteralPath $staleFile.FullName -Force -ErrorAction SilentlyContinue
+        $removed++
+      }
+      catch {
+        Write-VerboseParallelLog -Message "Unable to remove stale queue lock metadata '$($staleFile.FullName)': $($_.Exception.Message)"
+      }
+    }
+  }
+
+  if ($removed -gt 0) {
+    Write-ParallelLog -Message "Removed $removed stale queue lock metadata file(s) from '$ProcessingRoot'." -Target Both
+  }
+}
+
+function Unregister-QueuedFileMutexes {
+  [CmdletBinding()]
+  param()
+
+  foreach ($key in @($script:QueuedFileMutexes.Keys)) {
+    Unregister-QueuedFileMutex -FilePath $key
+  }
+
+  $script:QueuedFileMutexes.Clear()
 }
 
 function Resolve-Config {
@@ -577,12 +1028,12 @@ function Resolve-Config {
   )
 
   return [PSCustomObject]@{
-    ConfigData             = $resolvedConfigData
-    ConfigLocations        = $resolvedConfigLocations
-    LoadedConfigDirectory  = $resolvedLoadedConfigDirectory
-    ConfigFileName         = $resolvedConfigFileName
-    ConfigFileNames        = @($resolvedConfigFileNames)
-    SearchedPaths          = $searchedPaths
+    ConfigData            = $resolvedConfigData
+    ConfigLocations       = $resolvedConfigLocations
+    LoadedConfigDirectory = $resolvedLoadedConfigDirectory
+    ConfigFileName        = $resolvedConfigFileName
+    ConfigFileNames       = @($resolvedConfigFileNames)
+    SearchedPaths         = $searchedPaths
   }
 }
 
@@ -598,7 +1049,8 @@ if ($ViewReport -and -not $Analyze -and -not $Compact) {
   try {
     Start-Process -FilePath $pwshCommand -ArgumentList $argList -WorkingDirectory $PSScriptRoot | Out-Null
     Write-Host "Started report server helper using '$serveScriptPath'." -ForegroundColor Cyan
-  } catch {
+  }
+  catch {
     Write-Error "Failed to start report server helper '$serveScriptPath': $($_.Exception.Message)"
     exit 1
   }
@@ -638,6 +1090,9 @@ if (-not $configData) {
 
 $script:ffmpeg_path = Get-ConfigValue -ConfigKey "ffmpeg_path" -EnvVarName "FFENC_FFMPEG_PATH" -ConfigData $configData
 $explicitLogPath = Get-OptionalConfigValue -ConfigKey "log_path" -EnvVarName "FFENC_LOG_PATH" -ConfigData $configData
+if ($PSBoundParameters.ContainsKey('LogPath') -and -not [string]::IsNullOrWhiteSpace($LogPath)) {
+  $explicitLogPath = $LogPath
+}
 $defaultLogPrefix = $script:LogPrefix
 $defaultLogFileName = $script:logFileName
 $logResolved = Resolve-LogPath -ExplicitPath $explicitLogPath -DefaultPrefix $defaultLogPrefix -DefaultFileName $defaultLogFileName `
@@ -663,7 +1118,8 @@ $sonarr_apiKey = Get-ConfigValue -ConfigKey "sonarr_apiKey" -EnvVarName "SONARR_
 $script:ArrRefreshTimeoutSeconds = Get-OptionalConfigValue -ConfigKey "arr_refresh_timeout_seconds" -EnvVarName "FFENC_ARR_REFRESH_TIMEOUT_SECONDS" -ConfigData $configData
 if ([string]::IsNullOrWhiteSpace([string]$script:ArrRefreshTimeoutSeconds) -or -not [int]::TryParse($script:ArrRefreshTimeoutSeconds, [ref]$null)) {
   $script:ArrRefreshTimeoutSeconds = 15
-} else {
+}
+else {
   $script:ArrRefreshTimeoutSeconds = [int]$script:ArrRefreshTimeoutSeconds
 }
 
@@ -700,11 +1156,11 @@ if (-not (Test-Path -LiteralPath $script:log_path)) {
     $requestedLogPath = $script:log_path
     $fallbackLogPath = $script:InvokedScriptDir
     if ([string]::IsNullOrWhiteSpace($fallbackLogPath) -or
-        -not (Test-Path -LiteralPath $fallbackLogPath -PathType Container -ErrorAction SilentlyContinue)) {
+      -not (Test-Path -LiteralPath $fallbackLogPath -PathType Container -ErrorAction SilentlyContinue)) {
       $fallbackLogPath = $script:ScriptRoot
     }
     if ([string]::IsNullOrWhiteSpace($fallbackLogPath) -or
-        -not (Test-Path -LiteralPath $fallbackLogPath -PathType Container -ErrorAction SilentlyContinue)) {
+      -not (Test-Path -LiteralPath $fallbackLogPath -PathType Container -ErrorAction SilentlyContinue)) {
       $fallbackLogPath = $PWD.Path
     }
 
@@ -847,7 +1303,7 @@ function Write-ParallelLog {
     catch {
       if (-not ($effectiveTarget -band [OutputTarget]::Console)) { throw }
     }
-    finally { if ($lockAcquired) { [void]$script:LogMutex.ReleaseMutex() }}
+    finally { if ($lockAcquired) { [void]$script:LogMutex.ReleaseMutex() } }
   }
 
   if ($effectiveTarget -band [OutputTarget]::Console) {
@@ -877,14 +1333,14 @@ if ($loadedConfigDirectory) {
 
   if ($configData) {
     $configSummary = ($configData.PSObject.Properties | ForEach-Object {
-      $k = $_.Name
-      $v = [string]$_.Value
-      if ($k -imatch 'key|secret|token|password') {
-        if ([string]::IsNullOrWhiteSpace($v)) { $v = '(not set)' }
-        elseif (-not $LogVerbose) { $v = ($v.Substring(0, [Math]::Min(4, $v.Length))) + '****' }
-      }
-      "$k=$v"
-    }) -join '; '
+        $k = $_.Name
+        $v = [string]$_.Value
+        if ($k -imatch 'key|secret|token|password') {
+          if ([string]::IsNullOrWhiteSpace($v)) { $v = '(not set)' }
+          elseif (-not $LogVerbose) { $v = ($v.Substring(0, [Math]::Min(4, $v.Length))) + '****' }
+        }
+        "$k=$v"
+      }) -join '; '
     Write-ParallelLog -Message "Configuration settings: $configSummary" -Target Log
   }
 }
@@ -1426,7 +1882,7 @@ function Get-HardwareEncoderProfile {
     $fallbackChain = @()
     for ($i = $selectedIndex; $i -lt ($HwAccelOptions.Count - 1); $i++) {
       $fromOpt = $HwAccelOptions[$i]
-      $toOpt   = $HwAccelOptions[$i + 1]
+      $toOpt = $HwAccelOptions[$i + 1]
       $fallbackChain += {
         param([string]$HwaccelArgs)
         $next = $HwaccelArgs
@@ -1511,26 +1967,26 @@ function Get-HardwareEncoderProfile {
 
   $nvencOptions = @(
     (New-HwAccelOption -Name 'cuda' -HwaccelArgs '-hwaccel cuda -hwaccel_output_format cuda' -ScaleFilter 'scale_cuda' -ScaleSuffix ':interp_algo=lanczos')
-    (New-HwAccelOption -Name 'cuda' -HwaccelArgs '-hwaccel cuda'                             -ScaleFilter 'scale_cuda' -ScaleSuffix ':interp_algo=lanczos')
-    (New-HwAccelOption -Name 'auto' -HwaccelArgs '-hwaccel auto'                             -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
-    (New-HwAccelOption -Name 'none' -HwaccelArgs ''                                          -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'cuda' -HwaccelArgs '-hwaccel cuda' -ScaleFilter 'scale_cuda' -ScaleSuffix ':interp_algo=lanczos')
+    (New-HwAccelOption -Name 'auto' -HwaccelArgs '-hwaccel auto' -ScaleFilter 'scale' -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'none' -HwaccelArgs '' -ScaleFilter 'scale' -ScaleSuffix ':flags=lanczos')
   )
 
   $amfOptions = @(
-    (New-HwAccelOption -Name 'd3d11va' -HwaccelArgs '-hwaccel d3d11va -hwaccel_output_format d3d11' -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
-    (New-HwAccelOption -Name 'dxva2'   -HwaccelArgs '-hwaccel dxva2'                               -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
-    (New-HwAccelOption -Name 'vaapi'   -HwaccelArgs '-hwaccel vaapi -hwaccel_output_format vaapi'  -ScaleFilter 'scale_vaapi' -ScaleSuffix ':format=nv12')
-    (New-HwAccelOption -Name 'vulkan'  -HwaccelArgs '-hwaccel vulkan -hwaccel_output_format vulkan' -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
-    (New-HwAccelOption -Name 'auto'    -HwaccelArgs '-hwaccel auto'                                -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
-    (New-HwAccelOption -Name 'none'    -HwaccelArgs ''                                             -ScaleFilter 'scale'      -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'd3d11va' -HwaccelArgs '-hwaccel d3d11va -hwaccel_output_format d3d11' -ScaleFilter 'scale' -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'dxva2' -HwaccelArgs '-hwaccel dxva2' -ScaleFilter 'scale' -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'vaapi' -HwaccelArgs '-hwaccel vaapi -hwaccel_output_format vaapi' -ScaleFilter 'scale_vaapi' -ScaleSuffix ':format=nv12')
+    (New-HwAccelOption -Name 'vulkan' -HwaccelArgs '-hwaccel vulkan -hwaccel_output_format vulkan' -ScaleFilter 'scale' -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'auto' -HwaccelArgs '-hwaccel auto' -ScaleFilter 'scale' -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'none' -HwaccelArgs '' -ScaleFilter 'scale' -ScaleSuffix ':flags=lanczos')
   )
 
   $qsvOptions = @(
-    (New-HwAccelOption -Name 'qsv'   -HwaccelArgs '-hwaccel qsv -hwaccel_output_format qsv'   -ScaleFilter 'scale_qsv'   -ScaleSuffix '')
-    (New-HwAccelOption -Name 'qsv'   -HwaccelArgs '-hwaccel qsv'                               -ScaleFilter 'scale'       -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'qsv' -HwaccelArgs '-hwaccel qsv -hwaccel_output_format qsv' -ScaleFilter 'scale_qsv' -ScaleSuffix '')
+    (New-HwAccelOption -Name 'qsv' -HwaccelArgs '-hwaccel qsv' -ScaleFilter 'scale' -ScaleSuffix ':flags=lanczos')
     (New-HwAccelOption -Name 'vaapi' -HwaccelArgs '-hwaccel vaapi -hwaccel_output_format vaapi' -ScaleFilter 'scale_vaapi' -ScaleSuffix ':format=nv12')
-    (New-HwAccelOption -Name 'auto'  -HwaccelArgs '-hwaccel auto'                              -ScaleFilter 'scale'       -ScaleSuffix ':flags=lanczos')
-    (New-HwAccelOption -Name 'none'  -HwaccelArgs ''                                           -ScaleFilter 'scale'       -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'auto' -HwaccelArgs '-hwaccel auto' -ScaleFilter 'scale' -ScaleSuffix ':flags=lanczos')
+    (New-HwAccelOption -Name 'none' -HwaccelArgs '' -ScaleFilter 'scale' -ScaleSuffix ':flags=lanczos')
   )
 
   $nvencProfile = Build-Profile -ProfileName 'nvenc' -Encoder 'hevc_nvenc' -CodecArgs {
@@ -1720,16 +2176,16 @@ function Get-FileMetadata {
   )
 
   $metadata = @{
-    path = $FilePath
-    size = $null
-    mtime = $null
-    ctime = $null
-    hash = $null
-    duration = $null
-    video = $null
-    audio = @()
+    path      = $FilePath
+    size      = $null
+    mtime     = $null
+    ctime     = $null
+    hash      = $null
+    duration  = $null
+    video     = $null
+    audio     = @()
     subtitles = @()
-    tags = @()
+    tags      = @()
   }
 
   try {
@@ -1737,7 +2193,8 @@ function Get-FileMetadata {
     $metadata.size = $fileInfo.Length
     $metadata.mtime = $fileInfo.LastWriteTimeUtc.ToString('o')
     $metadata.ctime = $fileInfo.CreationTimeUtc.ToString('o')
-  } catch {
+  }
+  catch {
     Write-ParallelLog -Message "Failed to get file system metadata for '$FilePath': $($_.Exception.Message)" -Level Error
     return $null
   }
@@ -1747,21 +2204,11 @@ function Get-FileMetadata {
       $metadata.hash = "size-mtime:$($metadata.size):$($fileInfo.LastWriteTimeUtc.Ticks)"
     }
     else {
-      # CRC32 via System.IO.Hashing (available in .NET 6+ / PS 7.x)
-      $stream = [System.IO.File]::OpenRead($FilePath)
-      try {
-        $crc = [System.IO.Hashing.Crc32]::new()
-        $buffer = [byte[]]::new(65536)
-        [int]$read = 0
-        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
-          $crc.Append([System.ReadOnlySpan[byte]]::new($buffer, 0, $read))
-        }
-        $metadata.hash = 'crc32:{0:x8}' -f $crc.GetCurrentHashAsUInt32()
-      } finally {
-        $stream.Dispose()
-      }
+      # CRC32 via shared helper for consistency with other script hashing use.
+      $metadata.hash = 'crc32:{0}' -f (Get-Crc32HexFromFile -FilePath $FilePath)
     }
-  } catch {
+  }
+  catch {
     Write-ParallelLog -Message "Failed to compute hash for '$FilePath': $($_.Exception.Message)" -Level Error
     return $null
   }
@@ -1769,10 +2216,10 @@ function Get-FileMetadata {
   # Only run ffprobe on file types it can meaningfully parse (video + audio containers).
   # Images, ebooks, subtitles and other companion files get filesystem-only metadata.
   $ffprobeCapableExts = @(
-    '.avi','.divx','.mkv','.mp4','.m4v','.m2ts','.mts','.mov','.mpg','.mpeg',
-    '.ts','.wmv','.flv','.webm','.3gp','.3g2','.vob','.f4v','.ogv','.rm','.rmvb','.asf',
-    '.mp3','.flac','.aac','.m4a','.ogg','.opus','.wav','.wma','.aiff','.aif',
-    '.alac','.ape','.wv','.mka','.dts','.ac3','.eac3','.dsf','.dff'
+    '.avi', '.divx', '.mkv', '.mp4', '.m4v', '.m2ts', '.mts', '.mov', '.mpg', '.mpeg',
+    '.ts', '.wmv', '.flv', '.webm', '.3gp', '.3g2', '.vob', '.f4v', '.ogv', '.rm', '.rmvb', '.asf',
+    '.mp3', '.flac', '.aac', '.m4a', '.ogg', '.opus', '.wav', '.wma', '.aiff', '.aif',
+    '.alac', '.ape', '.wv', '.mka', '.dts', '.ac3', '.eac3', '.dsf', '.dff'
   )
   $fileExt = [System.IO.Path]::GetExtension($FilePath).ToLowerInvariant()
 
@@ -1788,11 +2235,11 @@ function Get-FileMetadata {
           $videoStream = $probe.streams | Where-Object { $_.codec_type -eq 'video' } | Select-Object -First 1
           if ($videoStream) {
             $metadata.video = @{
-              codec    = $videoStream.codec_name
-              bitrate  = [int]$videoStream.bit_rate
-              width    = [int]$videoStream.width
-              height   = [int]$videoStream.height
-              hdr      = ($videoStream.color_space -eq 'bt2020nc' -or $videoStream.color_transfer -eq 'smpte2084')
+              codec   = $videoStream.codec_name
+              bitrate = [int]$videoStream.bit_rate
+              width   = [int]$videoStream.width
+              height  = [int]$videoStream.height
+              hdr     = ($videoStream.color_space -eq 'bt2020nc' -or $videoStream.color_transfer -eq 'smpte2084')
             }
           }
           $audioStreams = $probe.streams | Where-Object { $_.codec_type -eq 'audio' }
@@ -1807,7 +2254,8 @@ function Get-FileMetadata {
           $metadata.subtitles = $subtitleStreams | ForEach-Object { $_.tags.language } | Where-Object { $_ } | Sort-Object -Unique
         }
       }
-    } catch {
+    }
+    catch {
       Write-ParallelLog -Message "Failed to probe '$FilePath': $($_.Exception.Message)" -Level Error
       return $null
     }
@@ -1901,7 +2349,8 @@ function Export-MetadataToNDJSON {
     # Atomic replace
     [System.IO.File]::Move($tempNdjson, $ndjsonPath, $true)
     Unregister-AnalyzeTempArtifact -Path $tempNdjson
-  } catch {
+  }
+  catch {
     Write-ParallelLog -Message "Failed to write NDJSON: $($_.Exception.Message)" -Level Error
     if ($writer) { try { $writer.Dispose() } catch { } }
     if ($stream) { try { $stream.Dispose() } catch { } }
@@ -1924,7 +2373,8 @@ function Export-MetadataToNDJSON {
         "Generated: $generatedAt &bull; $entryCount entries"
       )
       $html | Out-File -LiteralPath $htmlPath -Encoding UTF8
-    } catch {
+    }
+    catch {
       Write-ParallelLog -Message "Failed to generate HTML: $($_.Exception.Message)" -Level Error
     }
   }
@@ -1955,7 +2405,8 @@ function Invoke-CompactMetadata {
         $entries += $line | ConvertFrom-Json
       }
     }
-  } catch {
+  }
+  catch {
     Write-ParallelLog -Message "Failed to read NDJSON for compaction: $($_.Exception.Message)" -Level Error
     return
   }
@@ -2005,7 +2456,8 @@ function Invoke-CompactMetadata {
     # Atomic replace
     [System.IO.File]::Move($tempNdjson, $ndjsonPath, $true)
     Unregister-AnalyzeTempArtifact -Path $tempNdjson
-  } catch {
+  }
+  catch {
     Write-ParallelLog -Message "Failed to compact NDJSON: $($_.Exception.Message)" -Level Error
     if (Test-Path -LiteralPath $tempNdjson -PathType Leaf -ErrorAction SilentlyContinue) { Remove-Item -LiteralPath $tempNdjson -Force -ErrorAction SilentlyContinue }
     Unregister-AnalyzeTempArtifact -Path $tempNdjson
@@ -2167,21 +2619,22 @@ function Get-InputItemList {
     # All known media file types. The library (derived from directory) identifies what it actually is.
     $allMediaExts = @(
       # Video
-      '.avi','.divx','.mkv','.mp4','.m4v','.m2ts','.mts','.mov','.mpg','.mpeg',
-      '.ts','.wmv','.flv','.webm','.3gp','.3g2','.vob','.f4v','.ogv','.rm','.rmvb','.asf',
+      '.avi', '.divx', '.mkv', '.mp4', '.m4v', '.m2ts', '.mts', '.mov', '.mpg', '.mpeg',
+      '.ts', '.wmv', '.flv', '.webm', '.3gp', '.3g2', '.vob', '.f4v', '.ogv', '.rm', '.rmvb', '.asf',
       # Audio
-      '.mp3','.flac','.aac','.m4a','.ogg','.opus','.wav','.wma','.aiff','.aif',
-      '.alac','.ape','.wv','.mka','.dts','.ac3','.eac3','.dsf','.dff',
+      '.mp3', '.flac', '.aac', '.m4a', '.ogg', '.opus', '.wav', '.wma', '.aiff', '.aif',
+      '.alac', '.ape', '.wv', '.mka', '.dts', '.ac3', '.eac3', '.dsf', '.dff',
       # Images
-      '.jpg','.jpeg','.png','.gif','.bmp','.tiff','.tif','.webp','.heic','.heif',
-      '.raw','.cr2','.cr3','.nef','.arw','.dng','.orf','.rw2','.pef',
+      '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp', '.heic', '.heif',
+      '.raw', '.cr2', '.cr3', '.nef', '.arw', '.dng', '.orf', '.rw2', '.pef',
       # Ebooks / documents
-      '.epub','.mobi','.azw','.azw3','.pdf','.cbz','.cbr','.cb7','.djvu',
+      '.epub', '.mobi', '.azw', '.azw3', '.pdf', '.cbz', '.cbr', '.cb7', '.djvu',
       # Subtitles / companion
-      '.srt','.ass','.ssa','.sub','.idx','.vtt','.sup'
+      '.srt', '.ass', '.ssa', '.sub', '.idx', '.vtt', '.sup'
     )
     { $allMediaExts -contains $_.Extension.ToLowerInvariant() }.GetNewClosure()
-  } else {
+  }
+  else {
     { $_.Extension -match '^\.(avi|divx|m.*|ts|wmv)' }
   }
 
@@ -2282,7 +2735,7 @@ function Invoke-ArrRefresh {
   }
 }
 
-function Queue-ArrRefreshTarget {
+function Enqueue-ArrRefreshTarget {
   param(
     [ArrType]$Type,
     [string]$TitleName,
@@ -2436,10 +2889,10 @@ function Start-TestProcess {
 
   $maxAttempts = [Math]::Max(1, $fallbackSteps.Count + 1)
 
-  $JobState.TestFullArgs      = $ffmpegArgs
-  $JobState.TestArgs          = $testArgs
-  $JobState.TestAttempt       = 1
-  $JobState.TestMaxAttempts   = $maxAttempts
+  $JobState.TestFullArgs = $ffmpegArgs
+  $JobState.TestArgs = $testArgs
+  $JobState.TestAttempt = 1
+  $JobState.TestMaxAttempts = $maxAttempts
   $JobState.TestFallbackSteps = $fallbackSteps
 
   Invoke-StartTestAttempt -JobId $JobId -JobState $JobState
@@ -2463,10 +2916,10 @@ function Invoke-StartTestAttempt {
 
   $p.Start() | Out-Null
   Register-ChildProcess -Process $p -JobId $JobId
-  $JobState.TestProcess    = $p
+  $JobState.TestProcess = $p
   $JobState.TestStderrTask = $p.StandardError.ReadToEndAsync()
-  $JobState.State          = "Testing"
-  $JobState.Status         = "Testing ($($JobState.TestAttempt)/$($JobState.TestMaxAttempts))..."
+  $JobState.State = "Testing"
+  $JobState.Status = "Testing ($($JobState.TestAttempt)/$($JobState.TestMaxAttempts))..."
 }
 
 function Start-EncodeProcess {
@@ -2857,6 +3310,15 @@ function Complete-JobFinalization {
 
   if (-not $MoveOnCompletion) { return }
 
+  $queueLockReleased = $false
+  $releaseQueueLock = {
+    if ($queueLockReleased) { return }
+    if ($JobState -and $JobState.Item -and (-not [string]::IsNullOrWhiteSpace($JobState.Item.FullName))) {
+      Unregister-QueuedFileMutex -FilePath $JobState.Item.FullName
+      $queueLockReleased = $true
+    }
+  }
+
   try {
     $srcFile = $JobState.Item
     $JobState.Status = "Verifying output..."
@@ -2896,6 +3358,8 @@ function Complete-JobFinalization {
         }
       }
 
+      & $releaseQueueLock
+
       if ($RefreshArrOnCompletion) {
         $JobState.Status = "Refreshing Arr..."
         $arr = Get-ArrContext -SourceFile $srcFile
@@ -2904,7 +3368,7 @@ function Complete-JobFinalization {
         }
         else {
           $titleName = (($arr.Type -eq [ArrType]::series -or $srcFile.Directory.Name.ToLower().StartsWith("season")) ? $srcFile.Directory.Parent.Name : $srcFile.Directory.Name)
-          Queue-ArrRefreshTarget -Type $arr.Type -TitleName $titleName -BaseUri $arr.BaseUri -ApiKey $arr.ApiKey -JobId $JobId
+          Enqueue-ArrRefreshTarget -Type $arr.Type -TitleName $titleName -BaseUri $arr.BaseUri -ApiKey $arr.ApiKey -JobId $JobId
         }
       }
 
@@ -2926,6 +3390,8 @@ function Complete-JobFinalization {
     Move-Item -LiteralPath $srcFile.FullName -Destination $fullProcessedPath -Force
     Write-ParallelLog -Message "Moved output to: '$($JobState.FinalOutputFile)'`n Archived source to: '$fullProcessedPath'." -Target Both -JobId $JobId
 
+    & $releaseQueueLock
+
     if ($RefreshArrOnCompletion) {
       $JobState.Status = "Refreshing Arr..."
       $arr = Get-ArrContext -SourceFile $srcFile
@@ -2934,7 +3400,7 @@ function Complete-JobFinalization {
       }
       else {
         $titleName = (($arr.Type -eq [ArrType]::series -or $srcFile.Directory.Name.ToLower().StartsWith("season")) ? $srcFile.Directory.Parent.Name : $srcFile.Directory.Name)
-        Queue-ArrRefreshTarget -Type $arr.Type -TitleName $titleName -BaseUri $arr.BaseUri -ApiKey $arr.ApiKey -JobId $JobId
+        Enqueue-ArrRefreshTarget -Type $arr.Type -TitleName $titleName -BaseUri $arr.BaseUri -ApiKey $arr.ApiKey -JobId $JobId
       }
     }
 
@@ -3080,6 +3546,8 @@ function Get-QueuedWorkItem {
     TestMaxAttempts      = 0
     TestFallbackSteps    = @()
     TestRetryAfter       = [DateTime]::MinValue
+    QueueLockName        = ""
+    QueueLockFile        = ""
 
   }
 
@@ -3118,7 +3586,10 @@ function Stop-ParallelExecution {
   # Drain pending first so no new work is started while active processes are being stopped.
   if ($PendingQueue) {
     while ($PendingQueue.Count -gt 0) {
-      [void]$PendingQueue.Dequeue()
+      $pendingItem = $PendingQueue.Dequeue()
+      if ($pendingItem -and $pendingItem.Item -and (-not [string]::IsNullOrWhiteSpace($pendingItem.Item.FullName))) {
+        Unregister-QueuedFileMutex -FilePath $pendingItem.Item.FullName
+      }
       $canceledPending++
     }
   }
@@ -3207,6 +3678,23 @@ function Register-CancellationHandler {
             try { $active.TestProcess.WaitForExit(5000) } catch { }
           }
         }
+      }
+
+      # Release queue locks promptly during engine shutdown/abort handling.
+      if ($script:QueuedFileMutexes) {
+        foreach ($key in @($script:QueuedFileMutexes.Keys)) {
+          $entry = $script:QueuedFileMutexes[$key]
+          if ($entry) {
+            if ($entry.LockFile -and (Test-Path -LiteralPath $entry.LockFile -PathType Leaf -ErrorAction SilentlyContinue)) {
+              try { Remove-Item -LiteralPath $entry.LockFile -Force -ErrorAction SilentlyContinue } catch { }
+            }
+            if ($entry.Mutex) {
+              try { [void]$entry.Mutex.ReleaseMutex() } catch { }
+              try { $entry.Mutex.Dispose() } catch { }
+            }
+          }
+        }
+        $script:QueuedFileMutexes.Clear()
       }
     }
   }
@@ -3322,7 +3810,8 @@ if ($Analyze -or $Compact) {
       Write-ParallelLog -Message "Another -Analyze run is already in progress for this directory" -Level Error
       exit 1
     }
-  } catch {
+  }
+  catch {
     Write-ParallelLog -Message "Failed to acquire mutex: $($_.Exception.Message)" -Level Error
     exit 1
   }
@@ -3429,10 +3918,12 @@ if ($Analyze -or $Compact) {
       $filesPerMinute = [Math]::Round(($metadataList.Count / [Math]::Max(0.001, $analysisElapsed.TotalMinutes)), 2)
       Write-ParallelLog -Message "Analysis timing summary: total=$([Math]::Round($analysisElapsed.TotalMinutes, 2)) min; avg/file=$avgSecondsPerFile s; throughput=$filesPerMinute files/min; files=$($metadataList.Count)." -Target Both
       Write-ParallelLog -Message "Analysis completed: processed $($metadataList.Count) files" -Target Both
-    } else {
+    }
+    else {
       Write-ParallelLog -Message "No valid metadata collected" -Target Both
     }
-  } finally {
+  }
+  finally {
     Remove-AnalyzeTempArtifacts -OutputDir $outputDir
     if ($mutex) {
       try { $mutex.ReleaseMutex() } catch { }
@@ -3466,6 +3957,8 @@ try {
   if (-not (Test-Path -LiteralPath $processing_path)) {
     New-Item -Path $processing_path -ItemType Directory | Out-Null
   }
+
+  Remove-StaleQueuedFileLockMetadata -ProcessingRoot $processing_path
 
   # Shared synchronized state is owned by the host loop and read for progress rendering.
   $sync = [System.Collections.Hashtable]::Synchronized(@{})
@@ -3506,8 +3999,24 @@ try {
       $candidate = $candidates.Dequeue()
       $work = Get-QueuedWorkItem -Item $candidate -JobId $nextId
       if ($work) {
-        $pending.Enqueue($work)
-        $nextId++
+        if ($script:QueuedFileMutexes.ContainsKey($work.Item.FullName)) {
+          Write-VerboseParallelLog -Message "Skipping duplicate queue candidate in current run: '$($work.Item.FullName)'"
+          $triagedThisTick++
+          $needRefill = (($runningBeforeTriage + $pending.Count) -lt $MaxParallelJobs)
+          continue
+        }
+
+        $lockEntry = Register-QueuedFileMutex -FilePath $work.Item.FullName -ProcessingRoot $processing_path
+        if ($lockEntry) {
+          $script:QueuedFileMutexes[$work.Item.FullName] = $lockEntry
+          $work.QueueLockName = $lockEntry.LockName
+          $work.QueueLockFile = $lockEntry.LockFile
+          $pending.Enqueue($work)
+          $nextId++
+        }
+        else {
+          Write-ParallelLog -Message "Skipping '$($work.Item.FullName)': queue lock already held by another active run." -Level Warning -Target Both
+        }
       }
 
       $triagedThisTick++
@@ -3738,7 +4247,7 @@ finally {
   }
 
   if ($script:ProcessJobHandle -ne [IntPtr]::Zero) {
-    try { [void][FfmpegH265.JobObjectNative]::CloseHandle($script:ProcessJobHandle) }
+    try { [void][ffmpegH265.JobObjectNative]::CloseHandle($script:ProcessJobHandle) }
     catch {
       Write-VerboseParallelLog -Message "Unable to close process containment job handle cleanly: $($_.Exception.Message)"
     }
@@ -3757,6 +4266,8 @@ finally {
     }
     $script:LogMutex = $null
   }
+
+  Unregister-QueuedFileMutexes
 
   $script:StateTableRef = $null
   $script:PendingQueueRef = $null

@@ -22,6 +22,7 @@ This script automates the batch conversion of video files to H.265 format using 
 - **Graceful Cancellation**: Ctrl+C handling with proper cleanup of running processes
 - **Faster Test Preflight**: Per-job ffmpeg capability tests now use reduced probe settings (`-analyzeduration 64M -probesize 64M`) and a narrow video-only frame sample (`-map 0:v:0 -an -sn -dn -frames:v 48`) before full encode starts; AV1 inputs run a one-time CUDA decode capability probe per run, and when unsupported the script skips initial CUDA decode test variants and begins from a safer fallback path
 - **Incremental Processing**: Skip already-converted files and resume interrupted batches
+- **Cross-Run Queue Deduplication**: Uses per-file mutex locks during queue admission so simultaneous script runs do not process the same input file
 - **Metadata Analysis Mode**: Scan video libraries and generate comprehensive metadata reports with HTML visualization
 
 ## Metadata Analysis Mode
@@ -36,7 +37,7 @@ The script supports a metadata analysis mode (`-Analyze`) that scans video files
 - **Theme Toggle**: Report defaults to dark theme and allows in-browser dark/light switching
 - **Automatic Compaction**: Removes entries for deleted files and maintains current state
 - **Parallel Run Prevention**: Uses mutex to prevent concurrent analysis runs on the same directory
-- **Hash Strategies**: Supports `size-mtime` change tracking (Analyze default, fastest) or `crc32` content hashing
+- **Hash Strategies**: Supports `size-mtime` change tracking (Analyze default, fastest) or `crc32` content hashing via the script's built-in CRC32 implementation, so it works on current PowerShell 7.5 / .NET runtimes including .NET 8
 
 ### Usage
 
@@ -44,7 +45,7 @@ The script supports a metadata analysis mode (`-Analyze`) that scans video files
 # Basic analysis (default uses size+mtime change tracking for speed)
 .\ffmpeg_h265.ps1 -Path "Z:\Movies" -Analyze
 
-# Use CRC32 content hashing (faster than MD5/SHA256)
+# Use CRC32 content hashing (faster than MD5/SHA256, works on .NET 8)
 .\ffmpeg_h265.ps1 -Path "Z:\Movies" -Analyze -HashAlgorithm crc32
 
 # Compact existing metadata (remove deleted files)
@@ -161,9 +162,14 @@ For environment/deployment settings, precedence is always:
 2. Config file value
 3. Fail fast for required settings
 
-For `log_path`, step 3 is different: if missing from env/config, the script falls back to config discovery locations (loaded config directory, then current directory, then script directory).
+For `log_path`, precedence is:
 
-`-ConfigPath` is the only configuration-related parameter and only controls where config is loaded from. It is not needed for standalone `-ViewReport`.
+1. `-LogPath` parameter (if provided)
+2. `FFENC_LOG_PATH` environment variable
+3. `log_path` in config
+4. Discovery fallback (loaded config directory, then current directory, then script directory)
+
+`-ConfigPath` and `-LogPath` are the configuration-related parameters. `-ConfigPath` only controls where config is loaded from and is not needed for standalone `-ViewReport`.
 
 ### Config File (Optional Fallback)
 
@@ -395,9 +401,10 @@ Use environment variables as primary config (checked first), with ConfigPath as 
 | `-SkipFileLock` | switch | false | Skip file lock check (process files even if in use) |
 | `-Analyze` | switch | false | Analyze metadata and generate report files without encoding |
 | `-Compact` | switch | false | Compact existing metadata report data (remove deleted files) |
-| `-HashAlgorithm` | string | "size-mtime" | Analyze hash strategy: `size-mtime` (fastest, default) or `crc32` |
+| `-HashAlgorithm` | string | "size-mtime" | Analyze hash strategy: `size-mtime` (fastest, default) or `crc32` using the script's built-in CRC32 implementation |
 | `-ViewReport` | switch | false | Launch report viewer helper (`serve_report.ps1 -Report runtime`) and open the runtime report; when used alone it does not require `-Path` or config loading |
 | `-ConfigPath` | string | "" | Directory containing ffmpeg_h265.config.json (overrides auto-discovery for encode/analyze/compact modes) |
+| `-LogPath` | string | "" | Log output path override for the current run (accepts directory or full log file path; takes precedence over `FFENC_LOG_PATH` and config `log_path`) |
 | `-Encoder` | string | "auto" | Encoder profile: `auto`, `nvenc`, `amf`, `qsv`, `software` |
 
 When `-Encoder auto` is used (default), the script detects available HEVC encoders from ffmpeg and picks one automatically. Set `-Encoder` to a specific value to bypass detection.
@@ -462,13 +469,15 @@ See the **Configuration** section above for how to customize these paths.
 
 When `-LogEnabled` is specified, logs are created in the configured log directory:
 
-Logs are written to `log_path` from config (or `FFMPEG_LOG_PATH` from environment variables).
-If `log_path` is not provided, the script uses config discovery locations (loaded config directory, then current directory, Documents, script directory).
+Logs are written using this precedence: `-LogPath` parameter, then `FFENC_LOG_PATH`, then config `log_path`.
+If none are provided, the script uses discovery fallback (loaded config directory, then current directory, then script directory).
 
 - **Main Log Format**: `ffmpeg_h265_YYYYMMDDHHMMSSFFFF_{PID}.log`
 - **Per-Job Progress Log Format**: `ffmpeg_h265_progress_job{JobId}_YYYYMMDDHHMMSS_{PID}.log` (when `-LogVerbose` is enabled)
 - **Auto-cleanup**: Logs older than 24 hours or smaller than 2KB are automatically removed
 - **Thread-safe**: Mutex-protected logging for parallel operations
+
+When encoding jobs are queued, the script also acquires a per-file cross-process mutex and writes lock metadata in the processing directory (including owning `PID`, process start time, and script identity). These queue locks are released and metadata files are removed on normal completion, cancellation/abort, and PowerShell engine exit handling. On the next startup, stale queue lock metadata files left by previously terminated processes are cleaned up automatically by validating whether the recorded script process is still active.
 
 ## Media Server Integration
 
