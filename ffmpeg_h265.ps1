@@ -60,13 +60,15 @@
 .PARAMETER Encoder
   Encoder profile: auto, nvenc, amf, qsv, software
 .PARAMETER Analyze
-  Analyze metadata and generate report files without encoding
+  Analyze MediaAudit and generate report files without encoding
 .PARAMETER ViewReport
   Launch report viewer helper (serve_report.ps1 -Report runtime) and open the runtime report; when used alone it does not require -Path or config loading
 .PARAMETER HashAlgorithm
   Analyze hash strategy: size-mtime (fastest, default) or crc32 using the script's built-in CRC32 implementation
 .PARAMETER Compact
-  Compact existing metadata report data (remove deleted files)
+  Compact existing MediaAudit report data (remove deleted files)
+.PARAMETER MigrateToSQLite
+  Migrate existing NDJSON MediaAudit to SQLite database format
 .EXAMPLE
   .\ffmpeg_h265.ps1 -Path "V:\Media\TV Shows"
   Convert all video files in a directory using default settings.
@@ -81,7 +83,7 @@
   Forces re-encoding using 6 Mbps bitrate limit, even if files are already H.265 encoded.
 .EXAMPLE
   .\ffmpeg_h265.ps1 -Path "Z:\Movies" -Analyze
-  Analyze metadata and generate report files without encoding.
+  Analyze MediaAudit and generate report files without encoding.
 .EXAMPLE
   .\ffmpeg_h265.ps1 -ViewReport
   Launch report viewer and open the runtime report without requiring -Path or config.
@@ -121,7 +123,8 @@ param(
   [Parameter(Mandatory = $false)][switch] $Analyze,
   [Parameter(Mandatory = $false)][switch] $ViewReport,
   [Parameter(Mandatory = $false)][ValidateSet('size-mtime', 'crc32')][string] $HashAlgorithm = 'size-mtime',
-  [Parameter(Mandatory = $false)][switch] $Compact
+  [Parameter(Mandatory = $false)][switch] $Compact,
+  [Parameter(Mandatory = $false)][switch] $MigrateToSQLite
 )
 
 $ShowProgress = -not $NoProgress.IsPresent
@@ -159,12 +162,471 @@ $script:TestFrameCount = 48
 $script:CudaAv1DecodeSupportKnown = $false
 $script:CudaAv1DecodeSupported = $false
 
+# SQLite backend configuration
+$script:UseSQLiteBackend = $true  # Default to SQLite for new installations
+$script:SQLiteProviderAvailable = $false
+$script:MediaAuditDbPath = $null
+
 if ($Analyze.IsPresent -and (-not $PSBoundParameters.ContainsKey('HashAlgorithm'))) {
   $HashAlgorithm = 'size-mtime'
 }
 
 if ($PSVersionTable.PSVersion -lt [version]'7.5.0') {
   throw "This script requires PowerShell 7.5 or newer. Current version: $($PSVersionTable.PSVersion)"
+}
+
+function Get-ImpliedLibraryName {
+  param(
+    [Parameter(Mandatory = $false)][string]$PathValue
+  )
+
+  if ([string]::IsNullOrWhiteSpace($PathValue)) { return "(root)" }
+
+  $parts = $PathValue -split '[\\/]+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  if ($parts.Count -eq 0) { return "(root)" }
+
+  $mediaIdx = -1
+  for ($i = 0; $i -lt $parts.Count; $i++) {
+    if ($parts[$i].ToLowerInvariant() -eq 'media') { $mediaIdx = $i; break }
+  }
+
+  if ($mediaIdx -ge 0 -and ($mediaIdx + 1) -lt $parts.Count) {
+    return $parts[$mediaIdx + 1]
+  }
+
+  if ($parts.Count -gt 1 -and $parts[0] -match '^[A-Za-z]:$') {
+    return $parts[1]
+  }
+
+  return $parts[0]
+}
+
+# Initialize SQLite backend
+function Initialize-SQLiteBackend {
+  param([Parameter(Mandatory = $true)][string]$OutputDir)
+
+  $script:MediaAuditDbPath = Join-Path $OutputDir 'mediaaudit.db'
+  $script:SQLiteProviderAvailable = $false
+
+  try {
+    Import-Module PSSQLite -ErrorAction Stop
+    $script:SQLiteProviderAvailable = $true
+    Write-ParallelLog -Message "SQLite backend initialized with PSSQLite module" -Target Log
+  }
+  catch {
+    Write-ParallelLog -Message "SQLite module not available, falling back to NDJSON: $($_.Exception.Message)" -Level Warning -Target Both
+    $script:UseSQLiteBackend = $false
+  }
+
+  # Auto-detect backend from existing files
+  $ndjsonPath = Join-Path $OutputDir 'mediaaudit.ndjson'
+  $dbPath = Join-Path $OutputDir 'mediaaudit.db'
+
+  if ((Test-Path $dbPath) -and $script:SQLiteProviderAvailable) {
+    $script:UseSQLiteBackend = $true
+    Write-ParallelLog -Message "Detected existing SQLite database, using SQLite backend" -Target Log
+  }
+  elseif (Test-Path $ndjsonPath) {
+    if ($script:SQLiteProviderAvailable) {
+      # NDJSON exists, SQLite available - offer migration
+      Write-ParallelLog -Message "Detected existing NDJSON file. SQLite is available - migrating to SQLite backend..." -Target Both
+
+      if (Convert-NDJSONToDatabase -NdjsonPath $ndjsonPath -DbPath $dbPath) {
+        $script:UseSQLiteBackend = $true
+        Write-ParallelLog -Message "Migration completed successfully. Using SQLite backend." -Target Both
+
+        # Optionally backup the old NDJSON
+        $backupPath = "$ndjsonPath.backup"
+        if (-not (Test-Path $backupPath)) {
+          Copy-Item -LiteralPath $ndjsonPath -Destination $backupPath -Force
+          Write-ParallelLog -Message "Original NDJSON backed up to: $backupPath" -Target Log
+        }
+      }
+      else {
+        Write-ParallelLog -Message "Migration failed, falling back to NDJSON backend" -Level Warning -Target Both
+        $script:UseSQLiteBackend = $false
+      }
+    }
+    else {
+      $script:UseSQLiteBackend = $false
+      Write-ParallelLog -Message "Detected existing NDJSON file, using NDJSON backend" -Target Log
+    }
+  }
+  else {
+    # New setup - use SQLite if available
+    if (-not $script:SQLiteProviderAvailable) {
+      $script:UseSQLiteBackend = $false
+      Write-ParallelLog -Message "No existing backend detected, but SQLite unavailable - using NDJSON" -Target Log
+    }
+  }
+
+  # Initialize database schema if using SQLite
+  if ($script:UseSQLiteBackend -and $script:SQLiteProviderAvailable) {
+    Initialize-MediaAuditDatabase -DbPath $script:MediaAuditDbPath
+  }
+}
+
+function Initialize-MediaAuditDatabase {
+  param([Parameter(Mandatory = $true)][string]$DbPath)
+
+  $schema = @'
+CREATE TABLE IF NOT EXISTS mediaaudit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  path TEXT NOT NULL UNIQUE,
+  size INTEGER,
+  mtime TEXT,
+  ctime TEXT,
+  hash TEXT,
+  duration_ms INTEGER,
+  library TEXT,
+  video_codec TEXT,
+  video_bitrate INTEGER,
+  video_width INTEGER,
+  video_height INTEGER,
+  video_hdr BOOLEAN,
+  analyzed_at TEXT,
+  UNIQUE(path)
+);
+
+CREATE TABLE IF NOT EXISTS audio_streams (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mediaaudit_id INTEGER NOT NULL,
+  language TEXT,
+  codec TEXT,
+  channels INTEGER,
+  FOREIGN KEY(mediaaudit_id) REFERENCES mediaaudit(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS subtitle_streams (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mediaaudit_id INTEGER NOT NULL,
+  language TEXT,
+  FOREIGN KEY(mediaaudit_id) REFERENCES mediaaudit(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS tags (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mediaaudit_id INTEGER NOT NULL,
+  tag TEXT,
+  FOREIGN KEY(mediaaudit_id) REFERENCES mediaaudit(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_path ON mediaaudit(path);
+CREATE INDEX IF NOT EXISTS idx_library ON mediaaudit(library);
+CREATE INDEX IF NOT EXISTS idx_video_codec ON mediaaudit(video_codec);
+CREATE INDEX IF NOT EXISTS idx_video_hdr ON mediaaudit(video_hdr);
+CREATE INDEX IF NOT EXISTS idx_analyzed_at ON mediaaudit(analyzed_at);
+CREATE INDEX IF NOT EXISTS idx_audio_lang ON audio_streams(language);
+CREATE INDEX IF NOT EXISTS idx_audio_metadata ON audio_streams(mediaaudit_id);
+CREATE INDEX IF NOT EXISTS idx_subtitle_metadata ON subtitle_streams(mediaaudit_id);
+CREATE INDEX IF NOT EXISTS idx_tag_metadata ON tags(mediaaudit_id);
+'@
+
+  try {
+    Invoke-SqliteQuery -DataSource $DbPath -Query $schema
+    Write-ParallelLog -Message "SQLite database schema initialized" -Target Log
+  }
+  catch {
+    Write-ParallelLog -Message "Failed to initialize SQLite schema: $($_.Exception.Message)" -Level Error
+    throw
+  }
+}
+
+function Save-MediaAuditBatch {
+  param(
+    [Parameter(Mandatory = $true)][array]$MediaAuditList
+  )
+
+  if (-not $script:UseSQLiteBackend -or -not $script:SQLiteProviderAvailable) {
+    throw "SQLite backend not available"
+  }
+
+  $dbPath = $script:MediaAuditDbPath
+
+  foreach ($meta in $MediaAuditList) {
+    if (-not $meta) { continue }
+
+    # Add analyzed_at timestamp
+    if (-not $meta.analyzed_at) {
+      $meta | Add-Member -NotePropertyName 'analyzed_at' -NotePropertyValue (Get-Date -Format 'o')
+    }
+
+    # Add library if missing
+    if (-not $meta.library) {
+      $meta | Add-Member -NotePropertyName 'library' -NotePropertyValue (Get-ImpliedLibraryName -PathValue $meta.path)
+    }
+
+    # Convert duration to milliseconds
+    $durationMs = if ($meta.duration) { [math]::Round($meta.duration) } else { $null }
+
+    # Insert/update main metadata
+    $insertQuery = @'
+INSERT INTO mediaaudit (
+  path, size, mtime, ctime, hash, duration_ms, library,
+  video_codec, video_bitrate, video_width, video_height, video_hdr, analyzed_at
+) VALUES (
+  @path, @size, @mtime, @ctime, @hash, @duration_ms, @library,
+  @video_codec, @video_bitrate, @video_width, @video_height, @video_hdr, @analyzed_at
+)
+ON CONFLICT(path) DO UPDATE SET
+  size = excluded.size,
+  mtime = excluded.mtime,
+  ctime = excluded.ctime,
+  hash = excluded.hash,
+  duration_ms = excluded.duration_ms,
+  library = excluded.library,
+  video_codec = excluded.video_codec,
+  video_bitrate = excluded.video_bitrate,
+  video_width = excluded.video_width,
+  video_height = excluded.video_height,
+  video_hdr = excluded.video_hdr,
+  analyzed_at = excluded.analyzed_at;
+'@
+
+    $params = @{
+      path = $meta.path
+      size = $meta.size
+      mtime = $meta.mtime
+      ctime = $meta.ctime
+      hash = $meta.hash
+      duration_ms = $durationMs
+      library = $meta.library
+      video_codec = $meta.video?.codec
+      video_bitrate = $meta.video?.bitrate
+      video_width = $meta.video?.width
+      video_height = $meta.video?.height
+      video_hdr = $meta.video?.hdr
+      analyzed_at = $meta.analyzed_at
+    }
+
+    Invoke-SqliteQuery -DataSource $dbPath -Query $insertQuery -SqlParameters $params
+
+    # Get the metadata ID
+    $idQuery = 'SELECT id FROM mediaaudit WHERE path = @path'
+    $idResult = Invoke-SqliteQuery -DataSource $dbPath -Query $idQuery -SqlParameters @{ path = $meta.path }
+    $metadataId = $idResult.id
+
+    # Handle audio streams
+    if ($meta.audio -and $meta.audio.Count -gt 0) {
+      # Delete existing audio streams
+      Invoke-SqliteQuery -DataSource $dbPath -Query 'DELETE FROM audio_streams WHERE mediaaudit_id = @id' -SqlParameters @{ id = $metadataId }
+
+      # Insert new audio streams
+      foreach ($audio in $meta.audio) {
+        $audioQuery = 'INSERT INTO audio_streams (mediaaudit_id, language, codec, channels) VALUES (@mediaaudit_id, @language, @codec, @channels)'
+        $audioParams = @{
+          mediaaudit_id = $metadataId
+          language = $audio.lang
+          codec = $audio.codec
+          channels = $audio.channels
+        }
+        Invoke-SqliteQuery -DataSource $dbPath -Query $audioQuery -SqlParameters $audioParams
+      }
+    }
+
+    # Handle subtitle streams
+    if ($meta.subtitles -and $meta.subtitles.Count -gt 0) {
+      # Delete existing subtitle streams
+      Invoke-SqliteQuery -DataSource $dbPath -Query 'DELETE FROM subtitle_streams WHERE mediaaudit_id = @id' -SqlParameters @{ id = $metadataId }
+
+      # Insert new subtitle streams
+      foreach ($subtitle in $meta.subtitles) {
+        $subQuery = 'INSERT INTO subtitle_streams (mediaaudit_id, language) VALUES (@mediaaudit_id, @language)'
+        $subParams = @{
+          mediaaudit_id = $metadataId
+          language = $subtitle
+        }
+        Invoke-SqliteQuery -DataSource $dbPath -Query $subQuery -SqlParameters $subParams
+      }
+    }
+
+    # Handle tags
+    if ($meta.tags -and $meta.tags.Count -gt 0) {
+      # Delete existing tags
+      Invoke-SqliteQuery -DataSource $dbPath -Query 'DELETE FROM tags WHERE mediaaudit_id = @id' -SqlParameters @{ id = $metadataId }
+
+      # Insert new tags
+      foreach ($tag in $meta.tags) {
+        $tagQuery = 'INSERT INTO tags (mediaaudit_id, tag) VALUES (@mediaaudit_id, @tag)'
+        $tagParams = @{
+          mediaaudit_id = $metadataId
+          tag = $tag
+        }
+        Invoke-SqliteQuery -DataSource $dbPath -Query $tagQuery -SqlParameters $tagParams
+      }
+    }
+  }
+}
+
+function Convert-NDJSONToDatabase {
+  param(
+    [Parameter(Mandatory = $true)][string]$NdjsonPath,
+    [Parameter(Mandatory = $true)][string]$DbPath
+  )
+
+  if (-not (Test-Path -LiteralPath $NdjsonPath -PathType Leaf)) {
+    Write-ParallelLog -Message "NDJSON file not found: $NdjsonPath" -Level Error
+    return $false
+  }
+
+  Write-ParallelLog -Message "Converting NDJSON to SQLite database..." -Target Both
+
+  try {
+    # Initialize database if it doesn't exist
+    if (-not (Test-Path -LiteralPath $DbPath -PathType Leaf)) {
+      Initialize-MediaAuditDatabase -DbPath $DbPath
+    }
+
+    # Read NDJSON file
+    $lines = Get-Content -LiteralPath $NdjsonPath -Encoding UTF8
+    $convertedCount = 0
+
+    foreach ($line in $lines) {
+      if ($line.Trim()) {
+        try {
+          $originalMeta = $line | ConvertFrom-Json
+          
+          # Create a new object to avoid property setting issues
+          $meta = [PSCustomObject]@{
+            path = $originalMeta.path
+            size = $originalMeta.size
+            mtime = $originalMeta.mtime
+            ctime = $originalMeta.ctime
+            hash = $originalMeta.hash
+            duration = $originalMeta.duration
+            video = $originalMeta.video
+            audio = $originalMeta.audio
+            subtitles = $originalMeta.subtitles
+            tags = $originalMeta.tags
+          }
+
+          # Ensure analyzed_at timestamp exists (add if missing for migration)
+          if (-not $meta.analyzed_at) {
+            $meta | Add-Member -NotePropertyName 'analyzed_at' -NotePropertyValue (Get-Date -Format 'o')
+          }
+
+          # Convert and save to database
+          Save-MediaAuditBatch -MediaAuditList @($meta)
+          $convertedCount++
+        }
+        catch {
+          Write-ParallelLog -Message "Failed to convert NDJSON line: $($_.Exception.Message)" -Level Warning
+        }
+      }
+    }
+
+    Write-ParallelLog -Message "Successfully converted $convertedCount records from NDJSON to SQLite" -Target Both
+    return $true
+
+  }
+  catch {
+    Write-ParallelLog -Message "Failed to convert NDJSON to database: $($_.Exception.Message)" -Level Error
+    return $false
+  }
+}
+
+function Export-DatabaseToNDJSON {
+  param(
+    [Parameter(Mandatory = $true)][string]$OutputDir
+  )
+
+  if (-not $script:UseSQLiteBackend -or -not $script:SQLiteProviderAvailable) {
+    return
+  }
+
+  $ndjsonPath = Join-Path $OutputDir 'mediaaudit.ndjson'
+
+  # Query all metadata
+  $metadataQuery = 'SELECT * FROM mediaaudit ORDER BY path'
+  $metadataResults = Invoke-SqliteQuery -DataSource $script:MediaAuditDbPath -Query $metadataQuery
+
+  $tempNdjson = "$ndjsonPath.$([guid]::NewGuid().ToString('N')).tmp"
+  Register-AnalyzeTempArtifact -Path $tempNdjson
+
+  try {
+    $stream = [System.IO.File]::Open($tempNdjson, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    $writer = [System.IO.StreamWriter]::new($stream, [System.Text.Encoding]::UTF8)
+
+    foreach ($row in $metadataResults) {
+      if (Test-AnalyzeCancellationRequested) {
+        Write-ParallelLog -Message "Analyze cancellation requested during NDJSON export; dropping temp artifact." -Level Warning -Target Both
+        return
+      }
+
+      # Get audio streams for this metadata
+      $audioQuery = 'SELECT language, codec, channels FROM audio_streams WHERE mediaaudit_id = @id ORDER BY rowid'
+      $audioResults = Invoke-SqliteQuery -DataSource $script:MediaAuditDbPath -Query $audioQuery -SqlParameters @{ id = $row.id }
+
+      # Get subtitle streams for this metadata
+      $subtitleQuery = 'SELECT language FROM subtitle_streams WHERE mediaaudit_id = @id ORDER BY rowid'
+      $subtitleResults = Invoke-SqliteQuery -DataSource $script:MediaAuditDbPath -Query $subtitleQuery -SqlParameters @{ id = $row.id }
+
+      # Get tags for this metadata
+      $tagQuery = 'SELECT tag FROM tags WHERE mediaaudit_id = @id ORDER BY rowid'
+      $tagResults = Invoke-SqliteQuery -DataSource $script:MediaAuditDbPath -Query $tagQuery -SqlParameters @{ id = $row.id }
+
+      # Reconstruct the original JSON structure
+      $meta = @{
+        path = $row.path
+        size = $row.size
+        mtime = $row.mtime
+        ctime = $row.ctime
+        hash = $row.hash
+        duration = $row.duration_ms
+        library = $row.library
+        video = @{
+          codec = $row.video_codec
+          bitrate = $row.video_bitrate
+          width = $row.video_width
+          height = $row.video_height
+          hdr = $row.video_hdr
+        }
+        audio = $audioResults | ForEach-Object { @{
+          lang = $_.language
+          codec = $_.codec
+          channels = $_.channels
+        } }
+        subtitles = $subtitleResults | ForEach-Object { $_.language }
+        tags = $tagResults | ForEach-Object { $_.tag }
+      }
+
+      $json = $meta | ConvertTo-Json -Compress -Depth 10
+      $writer.WriteLine($json)
+    }
+
+    $writer.Flush()
+    $writer.Dispose()
+    $stream.Dispose()
+
+    # Atomic replace
+    [System.IO.File]::Move($tempNdjson, $ndjsonPath, $true)
+    Unregister-AnalyzeTempArtifact -Path $tempNdjson
+  }
+  catch {
+    Write-ParallelLog -Message "Failed to export database to NDJSON: $($_.Exception.Message)" -Level Error
+    if (Test-Path -LiteralPath $tempNdjson -PathType Leaf -ErrorAction SilentlyContinue) {
+      Remove-Item -LiteralPath $tempNdjson -Force -ErrorAction SilentlyContinue
+    }
+    Unregister-AnalyzeTempArtifact -Path $tempNdjson
+  }
+}
+
+function Invoke-CompactMediaAuditSQLite {
+  param([Parameter(Mandatory = $true)][string]$OutputDir)
+
+  if (-not $script:UseSQLiteBackend -or -not $script:SQLiteProviderAvailable) {
+    return
+  }
+
+  # For now, just vacuum the database to reclaim space
+  # TODO: Implement proper compaction by comparing against filesystem
+  try {
+    Invoke-SqliteQuery -DataSource $script:MediaAuditDbPath -Query 'VACUUM;'
+    Write-ParallelLog -Message "SQLite database compacted (VACUUM)" -Target Log
+  }
+  catch {
+    Write-ParallelLog -Message "Failed to compact SQLite database: $($_.Exception.Message)" -Level Error
+  }
 }
 
 function Initialize-Crc32Support {
@@ -839,7 +1301,7 @@ function Test-QueuedFileMutexHasActiveOwner {
   }
 }
 
-function Remove-StaleQueuedFileLockMetadata {
+function Remove-StaleQueuedFileLockMediaAudit {
   [CmdletBinding()]
   param(
     [Parameter(Mandatory = $true)][string]$ProcessingRoot
@@ -2168,7 +2630,7 @@ function Remove-AnalyzeTempArtifacts {
   }
 }
 
-function Get-FileMetadata {
+function Get-FileMediaAudit {
   [OutputType([hashtable])]
   param(
     [Parameter(Mandatory = $true)][string]$FilePath,
@@ -2182,10 +2644,12 @@ function Get-FileMetadata {
     ctime     = $null
     hash      = $null
     duration  = $null
+    library   = $null
     video     = $null
     audio     = @()
     subtitles = @()
     tags      = @()
+    analyzed_at = (Get-Date -Format 'o')  # Add analyzed timestamp
   }
 
   try {
@@ -2264,42 +2728,45 @@ function Get-FileMetadata {
   return $metadata
 }
 
-function Export-MetadataToNDJSON {
+function Export-MediaAuditToNDJSON {
   param(
-    [Parameter(Mandatory = $true)][array]$MetadataList,
+    [Parameter(Mandatory = $true)][array]$MediaAuditList,
     [Parameter(Mandatory = $true)][string]$OutputDir,
     [Parameter(Mandatory = $false)][switch]$GenerateHtml
   )
 
-  $ndjsonPath = Join-Path $OutputDir "metadata.ndjson"
-  $htmlPath = Join-Path $OutputDir "metadata_report.html"
+  $ndjsonPath = Join-Path $OutputDir "mediaaudit.ndjson"
+  $htmlPath = Join-Path $OutputDir "mediaaudit_report.html"
 
-  function Get-ImpliedLibraryName {
-    param(
-      [Parameter(Mandatory = $false)][string]$PathValue
-    )
-
-    if ([string]::IsNullOrWhiteSpace($PathValue)) { return "(root)" }
-
-    $parts = $PathValue -split '[\\/]+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-    if ($parts.Count -eq 0) { return "(root)" }
-
-    $mediaIdx = -1
-    for ($i = 0; $i -lt $parts.Count; $i++) {
-      if ($parts[$i].ToLowerInvariant() -eq 'media') { $mediaIdx = $i; break }
+  # If using SQLite backend, export from database instead
+  if ($script:UseSQLiteBackend -and $script:SQLiteProviderAvailable) {
+    Export-DatabaseToNDJSON -OutputDir $OutputDir
+    # Generate HTML if requested
+    if ($GenerateHtml) {
+      try {
+        $generatedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        $templatePath = Join-Path $PSScriptRoot 'mediaaudit_report_template.html'
+        if (-not (Test-Path -LiteralPath $templatePath -PathType Leaf -ErrorAction SilentlyContinue)) {
+          throw "HTML template not found at: $templatePath"
+        }
+        # Count entries from database
+        $countQuery = 'SELECT COUNT(*) as count FROM mediaaudit'
+        $countResult = Invoke-SqliteQuery -DataSource $script:MediaAuditDbPath -Query $countQuery
+        $entryCount = $countResult.count.ToString('N0')
+        $html = (Get-Content -LiteralPath $templatePath -Raw -Encoding UTF8).Replace(
+          '<!-- REPORT_META -->',
+          "Generated: $generatedAt &bull; $entryCount entries"
+        )
+        $html | Out-File -LiteralPath $htmlPath -Encoding UTF8
+      }
+      catch {
+        Write-ParallelLog -Message "Failed to generate HTML: $($_.Exception.Message)" -Level Error
+      }
     }
-
-    if ($mediaIdx -ge 0 -and ($mediaIdx + 1) -lt $parts.Count) {
-      return $parts[$mediaIdx + 1]
-    }
-
-    if ($parts.Count -gt 1 -and $parts[0] -match '^[A-Za-z]:$') {
-      return $parts[1]
-    }
-
-    return $parts[0]
+    return
   }
 
+  # Legacy NDJSON mode
   # Append new metadata to NDJSON
   $tempNdjson = "$ndjsonPath.$([guid]::NewGuid().ToString('N')).tmp"
   Register-AnalyzeTempArtifact -Path $tempNdjson
@@ -2313,7 +2780,7 @@ function Export-MetadataToNDJSON {
 
     $stream = [System.IO.File]::Open($tempNdjson, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
     $writer = [System.IO.StreamWriter]::new($stream, [System.Text.Encoding]::UTF8)
-    foreach ($meta in $MetadataList) {
+    foreach ($meta in $MediaAuditList) {
       if (Test-AnalyzeCancellationRequested) {
         Write-ParallelLog -Message "Analyze cancellation requested during NDJSON write; dropping temp artifact." -Level Warning -Target Both
         return
@@ -2363,11 +2830,11 @@ function Export-MetadataToNDJSON {
   if ($GenerateHtml) {
     try {
       $generatedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-      $templatePath = Join-Path $PSScriptRoot 'metadata_report_template.html'
+      $templatePath = Join-Path $PSScriptRoot 'mediaaudit_report_template.html'
       if (-not (Test-Path -LiteralPath $templatePath -PathType Leaf -ErrorAction SilentlyContinue)) {
         throw "HTML template not found at: $templatePath"
       }
-      $entryCount = $MetadataList.Count.ToString('N0')
+      $entryCount = $MediaAuditList.Count.ToString('N0')
       $html = (Get-Content -LiteralPath $templatePath -Raw -Encoding UTF8).Replace(
         '<!-- REPORT_META -->',
         "Generated: $generatedAt &bull; $entryCount entries"
@@ -2380,12 +2847,19 @@ function Export-MetadataToNDJSON {
   }
 }
 
-function Invoke-CompactMetadata {
+function Invoke-CompactMediaAudit {
   param(
     [Parameter(Mandatory = $true)][string]$OutputDir
   )
 
-  $ndjsonPath = Join-Path $OutputDir "metadata.ndjson"
+  # Use SQLite compaction if available
+  if ($script:UseSQLiteBackend -and $script:SQLiteProviderAvailable) {
+    Invoke-CompactMediaAuditSQLite -OutputDir $OutputDir
+    return
+  }
+
+  # Legacy NDJSON compaction
+  $ndjsonPath = Join-Path $OutputDir "mediaaudit.ndjson"
   if (Test-AnalyzeCancellationRequested) {
     Write-ParallelLog -Message "Analyze cancellation requested before compaction; skipping compaction." -Level Warning -Target Both
     return
@@ -3775,7 +4249,7 @@ if ($oldLogs.Count -gt 0) {
 
 $hasInputPath = -not [string]::IsNullOrWhiteSpace($Path)
 
-if (($Analyze -or (-not $Compact -and -not $ViewReport)) -and -not $hasInputPath) {
+if (($Analyze -or (-not $Compact -and -not $ViewReport -and -not $MigrateToSQLite)) -and -not $hasInputPath) {
   Write-ParallelLog -Message "-Path is required for encode and analyze runs." -Level Error -Target Both
   exit 1
 }
@@ -3788,11 +4262,11 @@ if ($ViewReport -and -not $Analyze -and -not $Compact) {
   exit 0
 }
 
-# Handle -Analyze and -Compact modes
-if ($Analyze -or $Compact) {
+# Handle -Analyze, -Compact, and -MigrateToSQLite modes
+if ($Analyze -or $Compact -or $MigrateToSQLite) {
   # Keep analysis artifacts with encode logs so all run outputs are in one place.
   $outputDir = $script:log_path
-  $inProgressNdjsonPath = Join-Path $outputDir 'metadata.ndjson.inprogress'
+  $inProgressNdjsonPath = Join-Path $outputDir 'mediaaudit.ndjson.inprogress'
   if (-not (Test-Path $outputDir)) {
     Write-ParallelLog -Message "Output directory does not exist: $outputDir" -Level Error
     exit 1
@@ -3817,11 +4291,38 @@ if ($Analyze -or $Compact) {
   }
 
   try {
+    if ($MigrateToSQLite) {
+      $configText = ($script:RunConfig.GetEnumerator() | ForEach-Object { "{0}='{1}'" -f $_.Key, $_.Value }) -join "; "
+      Write-ParallelLog -Message "Start migration run. $configText" -Target Log
+      Write-ParallelLog -Message "Starting NDJSON to SQLite migration..." -Target Both
+      
+      # Initialize SQLite backend
+      Initialize-SQLiteBackend -OutputDir $outputDir
+      
+      # Perform migration
+      $ndjsonPath = Join-Path $outputDir 'mediaaudit.ndjson'
+      $dbPath = Join-Path $outputDir 'mediaaudit.db'
+      if (Convert-NDJSONToDatabase -NdjsonPath $ndjsonPath -DbPath $dbPath) {
+        Write-ParallelLog -Message "Migration completed successfully." -Target Both
+      } else {
+        Write-ParallelLog -Message "Migration failed." -Level Error -Target Both
+        exit 1
+      }
+
+      if ($ViewReport) {
+        if (-not (Start-ReportViewer -Report 'runtime')) {
+          exit 1
+        }
+      }
+
+      exit 0
+    }
+
     if ($Compact) {
       $configText = ($script:RunConfig.GetEnumerator() | ForEach-Object { "{0}='{1}'" -f $_.Key, $_.Value }) -join "; "
       Write-ParallelLog -Message "Start compaction run. $configText" -Target Log
       Write-ParallelLog -Message "Starting compaction mode" -Target Both
-      Invoke-CompactMetadata -OutputDir $outputDir
+      Invoke-CompactMediaAudit -OutputDir $outputDir
       if (Test-Path -LiteralPath $inProgressNdjsonPath -PathType Leaf -ErrorAction SilentlyContinue) {
         Remove-Item -LiteralPath $inProgressNdjsonPath -Force -ErrorAction SilentlyContinue
       }
@@ -3851,6 +4352,9 @@ if ($Analyze -or $Compact) {
 
     Write-ParallelLog -Message "Discovered $($items.Count) file(s) for analysis" -Target Both
 
+    # Initialize SQLite backend
+    Initialize-SQLiteBackend -OutputDir $outputDir
+
     $metadataList = @()
     Register-AnalyzeTempArtifact -Path $inProgressNdjsonPath
     if (Test-Path -LiteralPath $inProgressNdjsonPath -PathType Leaf -ErrorAction SilentlyContinue) {
@@ -3870,12 +4374,23 @@ if ($Analyze -or $Compact) {
       Write-Progress -Activity "Analyzing files" -Status "$processed/$($items.Count): $($item.Name)" -PercentComplete (($processed / $items.Count) * 100)
 
       $itemStartedAt = Get-Date
-      $meta = Get-FileMetadata -FilePath $item.FullName -HashAlgorithm $HashAlgorithm
+      $meta = Get-FileMediaAudit -FilePath $item.FullName -HashAlgorithm $HashAlgorithm
       $itemElapsedMs = ((Get-Date) - $itemStartedAt).TotalMilliseconds
       $analysisWorkMs += $itemElapsedMs
       if ($meta) {
         $metadataList += $meta
 
+        # Save to SQLite immediately for each item (or batch later)
+        if ($script:UseSQLiteBackend -and $script:SQLiteProviderAvailable) {
+          try {
+            Save-MediaAuditBatch -MediaAuditList @($meta)
+          }
+          catch {
+            Write-ParallelLog -Message "Failed to save MediaAudit to SQLite: $($_.Exception.Message)" -Level Error -Target Both
+          }
+        }
+
+        # Also append to in-progress NDJSON for compatibility
         try {
           $line = $meta | ConvertTo-Json -Compress -Depth 10
           [System.IO.File]::AppendAllText($inProgressNdjsonPath, $line + [Environment]::NewLine, [System.Text.Encoding]::UTF8)
@@ -3897,14 +4412,14 @@ if ($Analyze -or $Compact) {
     }
 
     if ($metadataList.Count -gt 0) {
-      Export-MetadataToNDJSON -MetadataList $metadataList -OutputDir $outputDir -GenerateHtml
+      Export-MediaAuditToNDJSON -MediaAuditList $metadataList -OutputDir $outputDir -GenerateHtml
       if (Test-AnalyzeCancellationRequested) {
         Remove-AnalyzeTempArtifacts -OutputDir $outputDir
         Write-ParallelLog -Message "Analyze canceled during output generation. Temporary artifacts were cleaned up." -Level Warning -Target Both
         exit 130
       }
 
-      Invoke-CompactMetadata -OutputDir $outputDir
+      Invoke-CompactMediaAudit -OutputDir $outputDir
       Remove-AnalyzeTempArtifacts -OutputDir $outputDir
 
       if (Test-AnalyzeCancellationRequested) {
@@ -3958,7 +4473,7 @@ try {
     New-Item -Path $processing_path -ItemType Directory | Out-Null
   }
 
-  Remove-StaleQueuedFileLockMetadata -ProcessingRoot $processing_path
+  Remove-StaleQueuedFileLockMediaAudit -ProcessingRoot $processing_path
 
   # Shared synchronized state is owned by the host loop and read for progress rendering.
   $sync = [System.Collections.Hashtable]::Synchronized(@{})

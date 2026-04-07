@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MediaAudit Report (Sample)</title>
+  <script>
+    const params = new URLSearchParams({
+      data: 'mediaaudit_sample.db',
+      title: 'MediaAudit Report (Sample)',
+      meta: 'Sample report - loads mediaaudit_sample.db'
+    });
+    window.location.replace(`mediaaudit_report.html?${params.toString()}`);
+  </script>
+</head>
+<body>
+  <p>Redirecting to the sample MediaAudit report...</p>
+  <p><a href="mediaaudit_report.html?data=mediaaudit_sample.db&title=MediaAudit%20Report%20(Sample)&meta=Sample%20report%20-%20loads%20mediaaudit_sample.db">Open the sample report</a></p>
+</body>
+</html>

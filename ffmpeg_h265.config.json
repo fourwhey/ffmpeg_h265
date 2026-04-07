@@ -1,0 +1,14 @@
+{
+  "ffmpeg_path": "C:\\ffmpeg",
+  "log_path": "V:\\Logs\\ffmpeg_nvenc_h265",
+  "processed_path": "V:\\Processed",
+  "processing_path": "V:\\ProcessingTemp",
+  "media_path": "V:\\Media",
+  "movies_subfolder": "Movies",
+  "tv_shows_subfolder": "TV Shows",
+  "radarr_baseUri": "http://localhost:7878",
+  "radarr_apiKey": "your-radarr-api-key-here",
+  "sonarr_baseUri": "http://localhost:8989",
+  "sonarr_apiKey": "your-sonarr-api-key-here",
+  "arr_refresh_timeout_seconds": 60
+}

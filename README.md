@@ -23,21 +23,29 @@ This script automates the batch conversion of video files to H.265 format using 
 - **Faster Test Preflight**: Per-job ffmpeg capability tests now use reduced probe settings (`-analyzeduration 64M -probesize 64M`) and a narrow video-only frame sample (`-map 0:v:0 -an -sn -dn -frames:v 48`) before full encode starts; AV1 inputs run a one-time CUDA decode capability probe per run, and when unsupported the script skips initial CUDA decode test variants and begins from a safer fallback path
 - **Incremental Processing**: Skip already-converted files and resume interrupted batches
 - **Cross-Run Queue Deduplication**: Uses per-file mutex locks during queue admission so simultaneous script runs do not process the same input file
-- **Metadata Analysis Mode**: Scan video libraries and generate comprehensive metadata reports with HTML visualization
+- **MediaAudit Mode**: Scan video libraries and generate comprehensive MediaAudit reports with HTML visualization
 
-## Metadata Analysis Mode
+## MediaAudit Mode
 
-The script supports a metadata analysis mode (`-Analyze`) that scans video files, extracts detailed metadata, and generates reports without performing any encoding.
+The script supports a MediaAudit mode (`-Analyze`) that scans video files, extracts detailed metadata, and generates reports without performing any encoding.
 
 ### Features
 
 - **Comprehensive Metadata**: Collects file hashes, timestamps, video/audio/subtitle details, and FFprobe data
-- **NDJSON Output**: Appends metadata to a newline-delimited JSON file for efficient processing
-- **HTML Reports**: Generates an interactive metadata dashboard with top-level filters, metric cards, and searchable metadata tables
+- **NDJSON Output**: Appends MediaAudit records to a newline-delimited JSON file for efficient processing
+- **HTML Reports**: Generates an interactive MediaAudit dashboard with top-level filters, metric cards, and searchable metadata tables
 - **Theme Toggle**: Report defaults to dark theme and allows in-browser dark/light switching
 - **Automatic Compaction**: Removes entries for deleted files and maintains current state
 - **Parallel Run Prevention**: Uses mutex to prevent concurrent analysis runs on the same directory
 - **Hash Strategies**: Supports `size-mtime` change tracking (Analyze default, fastest) or `crc32` content hashing via the script's built-in CRC32 implementation, so it works on current PowerShell 7.5 / .NET runtimes including .NET 8
+
+### File Size Considerations
+
+For large video libraries, the `mediaaudit.ndjson` file can grow significantly (hundreds of MB). The script is designed for efficient streaming processing, but consider:
+
+- **Regular Compaction**: Run `-Compact` periodically to remove entries for deleted files
+- **Incremental Updates**: Use size-mtime hashing for fast incremental scans
+- **Storage Planning**: Allocate sufficient disk space for metadata storage
 
 ### Usage
 
@@ -48,8 +56,11 @@ The script supports a metadata analysis mode (`-Analyze`) that scans video files
 # Use CRC32 content hashing (faster than MD5/SHA256, works on .NET 8)
 .\ffmpeg_h265.ps1 -Path "Z:\Movies" -Analyze -HashAlgorithm crc32
 
-# Compact existing metadata (remove deleted files)
+# Compact existing MediaAudit (remove deleted files)
 .\ffmpeg_h265.ps1 -Path "Z:\Movies" -Compact
+
+# Migrate existing NDJSON MediaAudit to SQLite database
+.\ffmpeg_h265.ps1 -MigrateToSQLite
 
 # Analyze and open the runtime report via local server helper
 .\ffmpeg_h265.ps1 -Path "Z:\Movies" -Analyze -ViewReport
@@ -62,36 +73,37 @@ The script supports a metadata analysis mode (`-Analyze`) that scans video files
 
 Analysis creates the following files in the resolved log/output directory (`log_path` / `FFENC_LOG_PATH`):
 
-- `metadata.ndjson`: Newline-delimited JSON with one metadata object per line
-- `metadata_report.html`: HTML table visualization of library metadata
+- `mediaaudit.ndjson`: Newline-delimited JSON with one MediaAudit object per line
+- `mediaaudit_report.html`: HTML table visualization of library MediaAudit
 
 ### Repository Samples
 
 The repository includes sample analysis artifacts that are intended to work standalone when opened locally:
 
-- `metadata_report_sample.ndjson`: sample NDJSON metadata data with sanitized sample titles
-- `metadata_report_sample.html`: sample report entry point that loads the sample NDJSON
+- `mediaaudit_report_sample.html`: sample report entry point that loads `mediaaudit_sample.db` via the local server's db to NDJSON serialization handler
+- `mediaaudit_sample.db`: sample SQLite database with the same sanitized data as the NDJSON sample; served as NDJSON by `serve_report.ps1`
 - The HTML report template is embedded in the script and generated at runtime (there is no standalone template file in the repo)
 
 These sample files are examples only. Runtime Analyze output is still written to your configured output directory (`log_path` / `FFENC_LOG_PATH`).
 
 ### Viewing the HTML Report
 
-The report fetches NDJSON data from the browser, so opening `metadata_report.html` directly via `file://` will not work reliably. Run a local web server from the directory that contains the report and NDJSON file, then open the served URL.
+The report loads its data via a local HTTP server — opening `mediaaudit_report.html` directly via `file://` will not work. The sample report loads from `mediaaudit_sample.db`; `serve_report.ps1` transparently serves `.db` requests as NDJSON by querying SQLite server-side.
 
 Preferred (repo helper script):
 
-`serve_report.ps1` starts a local HTTP server from the repo directory and automatically opens `metadata_report_sample.html` in your default browser by default. Use `-Report runtime` to open `metadata_report.html` instead.
+`serve_report.ps1` starts a local HTTP server and opens the **sample report** by default (no arguments). Use `-Report runtime` to open the runtime report against your configured output directory instead.
 
 You can also launch the runtime report viewer from the primary script by using `-ViewReport` (standalone, or combined with `-Analyze`). In standalone mode, it does not require `-Path` or config discovery.
 
 ```powershell
 cd ~/scripts/ffmpeg_h265
+# Open sample report (default):
 .\serve_report.ps1
+# Open runtime report:
+.\serve_report.ps1 -Report runtime
 # Optional custom port:
-# .\serve_report.ps1 -Port 8000
-# Open the runtime report instead of the sample report:
-# .\serve_report.ps1 -Report runtime
+# .\serve_report.ps1 -Port 8000 -Report runtime
 ```
 
 Fallback examples:
@@ -100,17 +112,17 @@ Fallback examples:
 # Python 3
 cd ~/scripts/ffmpeg_h265
 python -m http.server 8000
-# Open: http://localhost:8000/metadata_report.html
+# Open: http://localhost:8000/mediaaudit_report.html
 ```
 
 ```powershell
 # Node.js
 cd ~/scripts/ffmpeg_h265
 npx serve -l 8000
-# Open: http://localhost:8000/metadata_report.html
+# Open: http://localhost:8000/mediaaudit_report.html
 ```
 
-### Metadata Schema
+### MediaAudit Schema
 
 Each NDJSON entry contains:
 
@@ -401,6 +413,7 @@ Use environment variables as primary config (checked first), with ConfigPath as 
 | `-SkipFileLock` | switch | false | Skip file lock check (process files even if in use) |
 | `-Analyze` | switch | false | Analyze metadata and generate report files without encoding |
 | `-Compact` | switch | false | Compact existing metadata report data (remove deleted files) |
+| `-MigrateToSQLite` | switch | false | Migrate existing NDJSON metadata to SQLite database format |
 | `-HashAlgorithm` | string | "size-mtime" | Analyze hash strategy: `size-mtime` (fastest, default) or `crc32` using the script's built-in CRC32 implementation |
 | `-ViewReport` | switch | false | Launch report viewer helper (`serve_report.ps1 -Report runtime`) and open the runtime report; when used alone it does not require `-Path` or config loading |
 | `-ConfigPath` | string | "" | Directory containing ffmpeg_h265.config.json (overrides auto-discovery for encode/analyze/compact modes) |

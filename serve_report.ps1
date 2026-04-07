@@ -1,14 +1,16 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-  Starts a local HTTP server and opens the metadata report in the browser.
+  Starts a local HTTP server and opens the MediaAudit report in the browser.
 .DESCRIPTION
   Starts a System.Net.HttpListener on the specified port, serves files from this
-  script directory, and opens either metadata_report_sample.html or
-  metadata_report.html from that served root in the default browser.
+  script directory, and opens either mediaaudit_report_sample.html or
+  mediaaudit_report.html from that served root in the default browser.
+  Requests for .db files are served as NDJSON by querying the SQLite database
+  via PSSQLite (must be installed).
 .NOTES
   - Base URL: http://localhost:<Port>/
-  - Default page: metadata_report_sample.html
+  - Default page: mediaaudit_report_sample.html
   - Press Ctrl+C to stop the server.
 #>
 param(
@@ -19,10 +21,10 @@ param(
 $root = $PSScriptRoot
 if (-not $root) { $root = $PWD.Path }
 
-$defaultPage = if ($Report -eq 'sample' -and (Test-Path -LiteralPath (Join-Path $root 'metadata_report_sample.html') -PathType Leaf)) {
-  'metadata_report_sample.html'
+$defaultPage = if ($Report -eq 'sample' -and (Test-Path -LiteralPath (Join-Path $root 'mediaaudit_report_sample.html') -PathType Leaf)) {
+  'mediaaudit_report_sample.html'
 } else {
-  'metadata_report.html'
+  'mediaaudit_report.html'
 }
 
 $baseUrl   = "http://localhost:$Port/"
@@ -51,6 +53,68 @@ $mimeTypes = @{
   '.js'     = 'application/javascript; charset=utf-8'
   '.css'    = 'text/css; charset=utf-8'
   '.ico'    = 'image/x-icon'
+}
+
+# Query a SQLite MediaAudit database and return all rows as an NDJSON string.
+function Get-DbAsNdjson {
+  param([string]$DbPath)
+
+  Import-Module PSSQLite -ErrorAction Stop
+
+  # 4 bulk queries instead of N+1 per row
+  $rows     = Invoke-SqliteQuery -DataSource $DbPath -Query 'SELECT * FROM mediaaudit ORDER BY path'
+  $allAudio = Invoke-SqliteQuery -DataSource $DbPath -Query 'SELECT mediaaudit_id, language, codec, channels FROM audio_streams ORDER BY mediaaudit_id, rowid'
+  $allSubs  = Invoke-SqliteQuery -DataSource $DbPath -Query 'SELECT mediaaudit_id, language FROM subtitle_streams ORDER BY mediaaudit_id, rowid'
+  $allTags  = Invoke-SqliteQuery -DataSource $DbPath -Query 'SELECT mediaaudit_id, tag FROM tags ORDER BY mediaaudit_id, rowid'
+
+  # Index related rows by mediaaudit_id
+  $audioMap = @{}
+  foreach ($a in $allAudio) {
+    if (-not $audioMap.ContainsKey($a.mediaaudit_id)) { $audioMap[$a.mediaaudit_id] = [System.Collections.Generic.List[object]]::new() }
+    $audioMap[$a.mediaaudit_id].Add($a)
+  }
+  $subMap = @{}
+  foreach ($s in $allSubs) {
+    if (-not $subMap.ContainsKey($s.mediaaudit_id)) { $subMap[$s.mediaaudit_id] = [System.Collections.Generic.List[object]]::new() }
+    $subMap[$s.mediaaudit_id].Add($s)
+  }
+  $tagMap = @{}
+  foreach ($t in $allTags) {
+    if (-not $tagMap.ContainsKey($t.mediaaudit_id)) { $tagMap[$t.mediaaudit_id] = [System.Collections.Generic.List[object]]::new() }
+    $tagMap[$t.mediaaudit_id].Add($t)
+  }
+
+  $sb = [System.Text.StringBuilder]::new()
+
+  foreach ($row in $rows) {
+    $audio     = $audioMap[$row.id]
+    $subtitles = $subMap[$row.id]
+    $tags      = $tagMap[$row.id]
+
+    $meta = [ordered]@{
+      path      = $row.path
+      size      = $row.size
+      mtime     = $row.mtime
+      ctime     = $row.ctime
+      hash      = $row.hash
+      duration  = $row.duration_ms
+      library   = $row.library
+      video     = [ordered]@{
+        codec   = $row.video_codec
+        bitrate = $row.video_bitrate
+        width   = $row.video_width
+        height  = $row.video_height
+        hdr     = [bool]$row.video_hdr
+      }
+      audio     = @(if ($audio)     { $audio     | ForEach-Object { [ordered]@{ lang = $_.language; codec = $_.codec; channels = $_.channels } } })
+      subtitles = @(if ($subtitles) { $subtitles | ForEach-Object { $_.language } })
+      tags      = @(if ($tags)      { $tags      | ForEach-Object { $_.tag } })
+    }
+
+    $null = $sb.AppendLine(($meta | ConvertTo-Json -Compress -Depth 10))
+  }
+
+  return $sb.ToString()
 }
 
 try {
@@ -93,6 +157,25 @@ try {
     }
 
     $ext  = [System.IO.Path]::GetExtension($resolvedFile).ToLower()
+
+    # Serve .db files as NDJSON by querying SQLite.
+    if ($ext -eq '.db') {
+      try {
+        $ndjson = Get-DbAsNdjson -DbPath $resolvedFile
+        $bytes  = [System.Text.Encoding]::UTF8.GetBytes($ndjson)
+        $resp.ContentType     = 'application/x-ndjson; charset=utf-8'
+        $resp.ContentLength64 = $bytes.Length
+        $resp.OutputStream.Write($bytes, 0, $bytes.Length)
+        Write-Host "$(Get-Date -Format 'HH:mm:ss')  200  $($req.Url.LocalPath)  (db→ndjson)"
+      } catch {
+        $resp.StatusCode = 500
+        Write-Host "$(Get-Date -Format 'HH:mm:ss')  500  $($req.Url.LocalPath)  $_" -ForegroundColor Red
+      } finally {
+        $resp.Close()
+      }
+      continue
+    }
+
     $mime = if ($mimeTypes.ContainsKey($ext)) { $mimeTypes[$ext] } else { 'application/octet-stream' }
 
     try {
