@@ -82,7 +82,7 @@ The repository includes sample analysis artifacts that are intended to work stan
 
 - `mediaaudit_report_sample.html`: sample report entry point that loads `mediaaudit_sample.db` via the local server's db to NDJSON serialization handler
 - `mediaaudit_sample.db`: sample SQLite database with the same sanitized data as the NDJSON sample; served as NDJSON by `serve_report.ps1`
-- The HTML report template is embedded in the script and generated at runtime (there is no standalone template file in the repo)
+- `mediaaudit_report_template.html`: source HTML template used to generate runtime `mediaaudit_report.html`
 
 These sample files are examples only. Runtime Analyze output is still written to your configured output directory (`log_path` / `FFENC_LOG_PATH`).
 
