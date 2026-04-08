@@ -85,6 +85,7 @@ The repository includes sample analysis artifacts that are intended to work stan
 - `mediaaudit_report_template.html`: source HTML template used to generate runtime `mediaaudit_report.html`
 
 These sample files are examples only. Runtime Analyze output is still written to your configured output directory (`log_path` / `FFENC_LOG_PATH`).
+The runtime `mediaaudit_report.html` is generated output and is intentionally not tracked in this repository.
 
 ### Viewing the HTML Report
 
