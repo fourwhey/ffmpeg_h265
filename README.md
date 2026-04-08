@@ -225,6 +225,8 @@ Config file setup is optional. The default/primary configuration source is envir
 3. Set environment variables for primary config values (see mapping below; `log_path` is optional)
 4. Run the script normally; if any value is missing from env vars, the script falls back to config file discovery
 
+Note: `*.config.example.json` files are templates. The script does not auto-load them. To use file-based config discovery, create a runtime file named `ffmpeg_h265.config.json` (copy/rename the example), or rely on environment variables.
+
 ### Environment Variable Fallback (No Defaults)
 
 Environment variables are checked first for every required value.
